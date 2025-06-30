@@ -1,25 +1,34 @@
 import os
 import re
 import uuid
+import logging
 import numpy as np
 import pyarrow as pa
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
-)
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import google.generativeai as genai
 import voyageai
 import lancedb
 
+# Load environment variables
 load_dotenv()
+
+# Configure APIs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configure AI services
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
+# LanceDB setup
 embedding_dim = 768
 db = lancedb.connect("lancedb_data")
 
@@ -44,162 +53,423 @@ class TranscriptSegment:
         self.start = start
         self.duration = duration
 
-class YouTubeTranscriptService:
+
+class YouTubeWorkflowService:
+    def __init__(self):
+        self.youtube_api_key = os.getenv("YOUTUBE_API_KEY")
+        if self.youtube_api_key:
+            self.youtube = build('youtube', 'v3', developerKey=self.youtube_api_key)
+        else:
+            self.youtube = None
+            logger.warning("YouTube API key not found. Suggestions feature will be limited.")
+
     def extract_video_id(self, url: str) -> str:
-        match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
-        if not match:
-            raise ValueError("Invalid YouTube URL")
-        return match.group(1)
+        """Extract video ID from YouTube URL"""
+        patterns = [
+            r"(?:v=|\/)([0-9A-Za-z_-]{11})",
+            r"youtu\.be\/([0-9A-Za-z_-]{11})",
+            r"embed\/([0-9A-Za-z_-]{11})"
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
 
     def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
-        vid = self.extract_video_id(youtube_url)
+        """Get transcript segments from YouTube video"""
+        video_id = self.extract_video_id(youtube_url)
         try:
-            raw = YouTubeTranscriptApi.get_transcript(vid)
+            raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            return [TranscriptSegment(**segment) for segment in raw_transcript]
         except (VideoUnavailable, TranscriptsDisabled, NoTranscriptFound) as e:
-            raise ValueError(f"Transcript error: {e}")
-        return [TranscriptSegment(**seg) for seg in raw]
+            raise ValueError(f"Could not get transcript for video {video_id}: {str(e)}")
 
     def chunk_transcript(self, segments: List[TranscriptSegment]) -> List[Document]:
-        full_text = "\n".join(f"{i}|{seg.start}|{seg.duration}|{seg.text}" for i, seg in enumerate(segments))
+        """Chunk transcript into manageable pieces for embedding"""
+        # Create indexed text for chunking
+        full_text = "\n".join(f"{i}|{seg.start}|{seg.duration}|{seg.text}" 
+                             for i, seg in enumerate(segments))
+        
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
         raw_chunks = splitter.split_text(full_text)
 
         documents = []
         for chunk in raw_chunks:
             parts = chunk.split("\n")
-            idxs = [int(p.split("|")[0]) for p in parts if "|" in p]
-            if not idxs:
+            indices = []
+            
+            for part in parts:
+                if "|" in part:
+                    try:
+                        idx = int(part.split("|")[0])
+                        indices.append(idx)
+                    except (ValueError, IndexError):
+                        continue
+            
+            if not indices:
                 continue
-            first = segments[min(idxs)]
-            doc_text = "\n".join(p.split("|", 3)[-1] for p in parts)
-            documents.append(Document(page_content=doc_text, metadata={
-                "start": first.start,
-                "duration": sum(segments[i].duration for i in idxs)
-            }))
+            
+            # Get the first segment for metadata
+            first_segment = segments[min(indices)]
+            
+            # Extract clean text content
+            clean_text = "\n".join(part.split("|", 3)[-1] for part in parts if "|" in part)
+            
+            # Calculate total duration for this chunk
+            total_duration = sum(segments[i].duration for i in indices if i < len(segments))
+            
+            documents.append(Document(
+                page_content=clean_text,
+                metadata={
+                    "start": first_segment.start,
+                    "duration": total_duration
+                }
+            ))
+        
         return documents
 
+    def embed_text(self, text: str, task_type: str = "retrieval_document") -> List[float]:
+        """Generate embeddings for text using Google's embedding model"""
+        try:
+            result = genai.embed_content(
+                model="models/embedding-001",
+                content=text,
+                task_type=task_type
+            )
+            embedding = result["embedding"]
+            
+            # Ensure correct dimension
+            if len(embedding) != embedding_dim:
+                raise ValueError(f"Embedding dimension mismatch: expected {embedding_dim}, got {len(embedding)}")
+            
+            return embedding
+        except Exception as e:
+            logger.error(f"Error generating embedding: {e}")
+            raise
 
-def embed_text(text: str, task_type: str = "retrieval_document") -> List[float]:
-    result = genai.embed_content(
-        model="models/embedding-001",
-        content=text,
-        task_type=task_type
-    )
-    embedding = result["embedding"]
-    assert len(embedding) == embedding_dim, "Embedding dimension mismatch"
-    return embedding
+    def embed_texts_batch(self, texts: List[str], max_workers: int = 5) -> List[List[float]]:
+        """Generate embeddings for multiple texts using threading"""
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self.embed_text, text): i for i, text in enumerate(texts)}
+            embeddings = [None] * len(texts)
+            
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    embeddings[index] = future.result()
+                except Exception as e:
+                    logger.error(f"Failed to embed text at index {index}: {e}")
+                    # Use zero vector as fallback
+                    embeddings[index] = [0.0] * embedding_dim
+            
+            return embeddings
 
-def embed_texts_multithreaded(texts: List[str], max_workers: int = 6) -> List[List[float]]:
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(embed_text, text) for text in texts]
-        return [f.result() for f in as_completed(futures)]
+    def is_video_indexed(self, video_id: str) -> bool:
+        """Check if video is already indexed in the database"""
+        try:
+            count = table.count_rows(filter=f"video_id = '{video_id}'")
+            return count > 0
+        except Exception as e:
+            logger.error(f"Error checking if video is indexed: {e}")
+            return False
 
+    def index_video(self, youtube_url: str, video_id: str) -> bool:
+        """Index a video's transcript in the database"""
+        if self.is_video_indexed(video_id):
+            logger.info(f"Video {video_id} is already indexed.")
+            return True
 
-def is_video_already_indexed(video_id: str) -> bool:
-    return table.count_rows(filter=f"video_id = '{video_id}'") > 0
+        try:
+            logger.info(f"Getting transcript for video {video_id}...")
+            segments = self.get_transcript(youtube_url)
+            
+            logger.info(f"Chunking transcript into documents...")
+            chunks = self.chunk_transcript(segments)
+            
+            if not chunks:
+                logger.warning(f"No chunks created for video {video_id}")
+                return False
 
-def index_documents(chunks: List[Document], video_id: str):
-    if is_video_already_indexed(video_id):
-        print("✅ Video already indexed in LanceDB.")
-        return
+            logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+            texts = [doc.page_content for doc in chunks]
+            embeddings = self.embed_texts_batch(texts)
 
-    print("⚡ Generating Gemini embeddings...")
-    texts = [doc.page_content for doc in chunks]
-    vectors = embed_texts_multithreaded(texts)
+            # Prepare data for insertion
+            data = []
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                data.append({
+                    "id": str(uuid.uuid4()),
+                    "video_id": video_id,
+                    "text": chunk.page_content,
+                    "start": chunk.metadata["start"],
+                    "duration": chunk.metadata["duration"],
+                    "vector": embedding
+                })
 
-    data = []
-    for i, vec in enumerate(vectors):
-        data.append({
-            "id": str(uuid.uuid4()),
-            "video_id": video_id,
-            "text": chunks[i].page_content,
-            "start": chunks[i].metadata["start"],
-            "duration": chunks[i].metadata["duration"],
-            "vector": vec
-        })
+            logger.info(f"Inserting {len(data)} records into database...")
+            table.add(data)
+            logger.info(f"Successfully indexed video {video_id}")
+            return True
 
-    table.add(data)
-    print("✅ Indexed and stored in LanceDB.")
+        except Exception as e:
+            logger.error(f"Failed to index video {video_id}: {e}")
+            return False
 
-def search_with_rerank_multiquery(query: str, video_id: str, top_k: int = 2) -> List[Dict[str, Any]]:
-    queries = [q.strip() for q in re.split(r"[;,]", query) if q.strip()]
-    final_results = []
+    def search_video_content(self, query: str, video_id: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search within a video's indexed content"""
+        try:
+            # Generate query embedding
+            query_embedding = self.embed_text(query, task_type="retrieval_query")
+            
+            # Search in vector database
+            results = (
+                table.search(query_embedding, vector_column_name="vector")
+                .where(f"video_id = '{video_id}'")
+                .limit(top_k * 2)  # Get more results for reranking
+                .to_list()
+            )
+            
+            if not results:
+                return []
 
-    def is_far_enough(ts, used_timestamps):
-        return all(abs(ts - t) > 300 for t in used_timestamps)
-
-    for q in queries:
-        query_vec = embed_text(q, task_type="retrieval_query")
-        results = (
-            table.search(query_vec, vector_column_name="vector")
-            .where(f"video_id = '{video_id}'")
-            .limit(20)
-            .to_list()
-        )
-        if not results:
-            continue
-
-        texts = [r["text"] for r in results]
-        reranked = voyage.rerank(query=q, documents=texts, model="rerank-2", top_k=top_k * 3)
-
-        used_timestamps = set()
-        selected = []
-
-        for res in reranked.results:
-            doc = results[res.index]
-            ts = int(doc["start"])
-            if is_far_enough(ts, used_timestamps):
-                selected.append({
-                    "query": q,
+            # Rerank results if Voyage API is available
+            try:
+                texts = [r["text"] for r in results]
+                reranked = voyage.rerank(
+                    query=query, 
+                    documents=texts, 
+                    model="rerank-2", 
+                    top_k=top_k
+                )
+                
+                final_results = []
+                for res in reranked.results:
+                    doc = results[res.index]
+                    final_results.append({
+                        "text": doc["text"],
+                        "start": doc["start"],
+                        "duration": doc["duration"],
+                        "score": res.relevance_score,
+                        "url": f"https://www.youtube.com/watch?v={video_id}&t={int(doc['start'])}s"
+                    })
+                
+                return final_results
+                
+            except Exception as e:
+                logger.warning(f"Reranking failed, using original results: {e}")
+                # Fallback to original results without reranking
+                return [{
                     "text": doc["text"],
                     "start": doc["start"],
-                    "score": res.relevance_score
+                    "duration": doc["duration"],
+                    "score": 1.0 - (i * 0.1),  # Simple fallback scoring
+                    "url": f"https://www.youtube.com/watch?v={video_id}&t={int(doc['start'])}s"
+                } for i, doc in enumerate(results[:top_k])]
+
+        except Exception as e:
+            logger.error(f"Error searching video content: {e}")
+            return []
+
+    def search_youtube_videos(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Search for videos on YouTube using the API"""
+        if not self.youtube:
+            logger.error("YouTube API not available")
+            return []
+
+        try:
+            search_response = self.youtube.search().list(
+                part='id,snippet',
+                q=query,
+                type='video',
+                maxResults=max_results,
+                order='relevance'
+            ).execute()
+
+            videos = []
+            for item in search_response['items']:
+                videos.append({
+                    'video_id': item['id']['videoId'],
+                    'title': item['snippet']['title'],
+                    'description': item['snippet']['description'],
+                    'channel_title': item['snippet']['channelTitle'],
+                    'published_at': item['snippet']['publishedAt'],
+                    'url': f"https://www.youtube.com/watch?v={item['id']['videoId']}"
                 })
-                used_timestamps.add(ts)
-            if len(selected) >= top_k:
-                break
 
-        final_results.extend(selected)
+            return videos
 
-    return final_results
+        except HttpError as e:
+            logger.error(f"YouTube API error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Error searching YouTube: {e}")
+            return []
+
+    def get_video_title(self, video_id: str) -> str:
+        """Get video title from YouTube API"""
+        if not self.youtube:
+            return f"Video {video_id}"
+
+        try:
+            response = self.youtube.videos().list(
+                part='snippet',
+                id=video_id
+            ).execute()
+
+            if response['items']:
+                return response['items'][0]['snippet']['title']
+            else:
+                return f"Video {video_id}"
+
+        except Exception as e:
+            logger.error(f"Error getting video title: {e}")
+            return f"Video {video_id}"
 
 
-def make_url(video_id: str, start: float) -> str:
-    return f"https://www.youtube.com/watch?v={video_id}&t={int(start)}s"
+def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
+    """Print formatted video segments"""
+    if not segments:
+        print("❌ No relevant segments found.")
+        return
 
-def print_results(results: List[Dict[str, Any]], video_id: str):
-    print(f"\n🔎 Top {len(results)} results:\n")
-    for r in results:
-        snippet = " ".join(r['text'].split()[:25]) + "..."
-        print(f"- 🔑 Query: \"{r.get('query', 'N/A')}\"")
-        print(f"  ⏱️ Timestamp: [{int(r['start'])}s]")
-        print(f"  📄 Snippet: \"{snippet}\"")
-        print(f"  👉 {make_url(video_id, r['start'])} (score: {r['score']:.4f})\n")
+    if video_title:
+        print(f"\n🎥 Video: {video_title}")
+    
+    print(f"🎯 Found {len(segments)} relevant segments:")
+    print("-" * 60)
+
+    for i, segment in enumerate(segments, 1):
+        # Truncate text for display
+        text_preview = " ".join(segment['text'].split()[:30])
+        if len(segment['text'].split()) > 30:
+            text_preview += "..."
+
+        print(f"\n{i}. ⏱️  Timestamp: {int(segment['start'])}s")
+        print(f"   📊 Score: {segment['score']:.4f}")
+        print(f"   📝 Content: {text_preview}")
+        print(f"   🔗 Direct link: {segment['url']}")
+
+
+def print_youtube_search_results(videos: List[Dict[str, Any]]):
+    """Print formatted YouTube search results"""
+    if not videos:
+        print("❌ No videos found.")
+        return
+
+    print(f"\n🔍 Found {len(videos)} videos:")
+    print("-" * 60)
+
+    for i, video in enumerate(videos, 1):
+        # Truncate description
+        desc_preview = video['description'][:100]
+        if len(video['description']) > 100:
+            desc_preview += "..."
+
+        print(f"\n{i}. 📺 {video['title']}")
+        print(f"   👤 Channel: {video['channel_title']}")
+        print(f"   📅 Published: {video['published_at'][:10]}")
+        print(f"   📝 {desc_preview}")
+        print(f"   🔗 {video['url']}")
 
 
 def main():
+    """Main workflow function"""
+    print("🎬 YouTube Semantic Search Workflow")
+    print("=" * 50)
+
+    # Initialize service
+    service = YouTubeWorkflowService()
+
     try:
-        yt_url = input("🎥 YouTube URL: ").strip()
-        query = input("🧠 Search query (comma or semicolon separated): ").strip()
+        # Get user inputs
+        youtube_url = input("\n🎥 Enter YouTube video URL: ").strip()
+        if not youtube_url:
+            print("❌ YouTube URL is required.")
+            return
 
-        svc = YouTubeTranscriptService()
-        video_id = svc.extract_video_id(yt_url)
+        query = input("🔍 Enter your search query: ").strip()
+        if not query:
+            print("❌ Search query is required.")
+            return
 
-        segments = svc.get_transcript(yt_url)
-        chunks = svc.chunk_transcript(segments)
+        # Get suggestion flag
+        suggestion_input = input("🤖 Enable suggestions? (true/false) [default: false]: ").strip().lower()
+        suggestions_enabled = suggestion_input in ['true', 't', 'yes', 'y', '1']
 
-        index_documents(chunks, video_id)
+        # Get top_k parameter
+        try:
+            top_k = int(input("📊 Number of top segments to return [default: 5]: ").strip() or "5")
+        except ValueError:
+            top_k = 5
 
-        print("🔍 Performing semantic search and reranking...")
-        results = search_with_rerank_multiquery(query, video_id)
+        print(f"\n⚙️  Configuration:")
+        print(f"   📹 Video URL: {youtube_url}")
+        print(f"   🔍 Query: {query}")
+        print(f"   🤖 Suggestions: {'Enabled' if suggestions_enabled else 'Disabled'}")
+        print(f"   📊 Top K: {top_k}")
 
-        if results:
-            print_results(results, video_id)
-        else:
-            print("⚠️ No relevant matches found.")
+        # Extract video ID
+        try:
+            video_id = service.extract_video_id(youtube_url)
+            print(f"   🎯 Video ID: {video_id}")
+        except ValueError as e:
+            print(f"❌ {e}")
+            return
 
+        print("\n" + "=" * 50)
+
+        # Index the input video
+        print("🔄 Processing input video...")
+        if not service.index_video(youtube_url, video_id):
+            print("❌ Failed to process the video. Please check the URL and try again.")
+            return
+
+        # Search within the input video
+        print(f"🔍 Searching video content for: '{query}'")
+        video_segments = service.search_video_content(query, video_id, top_k)
+        
+        video_title = service.get_video_title(video_id)
+        print_video_segments(video_segments, video_title)
+
+        # If suggestions are enabled, also search for other videos
+        if suggestions_enabled:
+            print("\n" + "=" * 50)
+            print("🌟 SUGGESTIONS ENABLED - Searching for related videos...")
+            
+            related_videos = service.search_youtube_videos(query, max_results=5)
+            print_youtube_search_results(related_videos)
+
+            # Optionally search segments in related videos
+            if related_videos:
+                process_related = input("\n🤔 Process related videos for segments? (y/n) [default: n]: ").strip().lower()
+                
+                if process_related in ['y', 'yes', 'true', 't', '1']:
+                    print("\n🔄 Processing related videos...")
+                    
+                    for video in related_videos[:3]:  # Process top 3 related videos
+                        related_video_id = video['video_id']
+                        related_url = video['url']
+                        
+                        print(f"\n📹 Processing: {video['title']}")
+                        
+                        if service.index_video(related_url, related_video_id):
+                            related_segments = service.search_video_content(query, related_video_id, top_k=3)
+                            if related_segments:
+                                print_video_segments(related_segments, video['title'])
+                        else:
+                            print(f"⚠️  Could not process video: {video['title']}")
+
+        print("\n✅ Workflow completed!")
+
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Workflow interrupted by user.")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"\n❌ An error occurred: {e}")
+        logger.error(f"Workflow error: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     main()

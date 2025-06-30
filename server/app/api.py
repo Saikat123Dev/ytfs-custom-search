@@ -187,7 +187,7 @@ if __name__ == "__main__":
     logger.info(f"Reload: {reload}, Workers: {workers}")
     
     uvicorn.run(
-        "main:app",
+        "api:app",
         host=host,
         port=port,
         reload=reload,

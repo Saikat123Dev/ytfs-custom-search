@@ -5,6 +5,7 @@ from typing import List, Dict
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import logging
+import uvicorn
 
 # Import your YouTube service
 from services.youtube_service import YouTubeWorkflowService
@@ -175,3 +176,22 @@ async def root():
 async def health_check():
     return {"status": "healthy"}
 
+if __name__ == "__main__":
+    # Get configuration from environment variables with defaults
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 8000))
+    reload = os.getenv("RELOAD", "false").lower() == "true"
+    workers = int(os.getenv("WORKERS", 1))
+    
+    logger.info(f"Starting server on {host}:{port}")
+    logger.info(f"Reload: {reload}, Workers: {workers}")
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=reload,
+        workers=workers,
+        log_config=None,
+        access_log=False
+    )

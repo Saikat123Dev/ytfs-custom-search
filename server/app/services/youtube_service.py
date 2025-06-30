@@ -41,9 +41,11 @@ schema = pa.schema([
     ("vector", pa.list_(pa.float32(), embedding_dim))
 ])
 
-if "transcripts" in db.table_names():
+try:
     table = db.open_table("transcripts")
-else:
+except ValueError:
+    logger.warning("Failed to open 'transcripts' table. Dropping and recreating.")
+    db.drop_table("transcripts")
     table = db.create_table("transcripts", schema=schema)
 
 

@@ -8,8 +8,24 @@ from services.youtube_service import (
     is_video_already_indexed
 )
 from typing import List, Dict
-
+from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
+
+origins = [
+        "http://localhost:3000",  # Example: Your frontend development server
+        "http://localhost:5173", # Example: Your deployed frontend
+        # Add other allowed origins as needed
+    ]
+app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,  # Allow cookies and authorization headers
+        allow_methods=["*"],     # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
+        allow_headers=["*"],     # Allow all headers
+    )
+
+
+
 
 
 class SearchRequest(BaseModel):

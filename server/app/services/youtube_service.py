@@ -21,7 +21,9 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
 embedding_dim = 768
-db = lancedb.connect("lancedb_data")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+db = lancedb.connect(os.path.join(BASE_DIR, "lancedb_data"))
+print('db',db)
 
 schema = pa.schema([
     ("id", pa.string()),

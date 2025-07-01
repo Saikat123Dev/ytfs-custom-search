@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 
 interface SearchResult {
-  query: string
+ 
   timestamp: number
   snippet: string
   url: string
@@ -9,8 +9,14 @@ interface SearchResult {
 }
 
 interface ApiResponse {
-  video_id: string
-  results: SearchResult[]
+  video_id: string,
+  input_video: {
+    segments: SearchResult[]
+  },
+  title: string,
+  url: string,
+  suggestions_enabled:boolean,
+  total_input_segments:number
 }
 
 function App() {
@@ -25,6 +31,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
+  const [enableSuggestions,setenableuggestions]=useState(false);
   const [keepExtensionOpen, setKeepExtensionOpen] = useState(false)
   const iframeRef = useRef<HTMLIFrameElement>(null)
 
@@ -137,7 +144,7 @@ function App() {
         }
       }
     } else {
-      // Normal behavior - extension will close
+     
       if (typeof chrome !== 'undefined' && chrome.tabs) {
         chrome.tabs.create({ url: url })
       } else {
@@ -163,7 +170,10 @@ function App() {
         },
         body: JSON.stringify({
           youtube_url: videoLink,
-          query: userInput
+          query: userInput,
+          suggestions: enableSuggestions,
+          top_k: 8,
+          max_related_videos: 3
         })
       })
 
@@ -171,10 +181,11 @@ function App() {
         throw new Error(`Server responded with status ${response.status}`)
       }
 
-      const data: ApiResponse = await response.json()
-      setSearchResults(data.results || [])
+      const data:ApiResponse= await response.json()
+      console.log('data',data);
+      setSearchResults(data.input_video.segments || [])
       
-      if (data.results && data.results.length === 0) {
+      if (data.input_video.segments && data.input_video.segments.length === 0) {
         setError('No results found for your query')
       }
     } catch (error) {
@@ -313,7 +324,25 @@ function App() {
           )}
         </div>
 
-        {/* Search Button */}
+         <div className="flex items-center justify-between pt-3 border-t border-gray-100">
+  <div>
+    <h3 className="text-sm font-semibold text-gray-700">Enable Suggestions</h3>
+  </div>
+  <label className="relative inline-flex items-center cursor-pointer">
+    <input
+      type="checkbox"
+      checked={enableSuggestions}
+      onChange={(e) => setenableuggestions(e.target.checked)}
+      className="sr-only peer"
+    />
+    <div className="w-11 h-6 bg-gray-500 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500">
+    
+    </div>
+  </label>
+</div>
+
+
+
         <button
           onClick={youtubesearch}
           disabled={!isValidLink || !userInput.trim() || isLoading}
@@ -385,10 +414,8 @@ function App() {
                   {result.snippet}
                 </p>
                 
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-500 bg-gray-50 px-2 py-1 rounded-full">
-                    Query: "{result.query}"
-                  </span>
+                <div className="flex justify-end">
+                 
                   <button
                     onClick={() => openInYouTube(result.url)}
                     className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1"

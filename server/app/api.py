@@ -2,19 +2,33 @@ import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
 
-# Import your YouTube service
 from services.youtube_service import YouTubeWorkflowService
+app = FastAPI()
 
-# Configure logging
+origins = [
+        "http://localhost:3000",  # Example: Your frontend development server
+        "http://localhost:5173", # Example: Your deployed frontend
+        # Add other allowed origins as needed
+    ]
+app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,  # Allow cookies and authorization headers
+        allow_methods=["*"],     # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
+        allow_headers=["*"],     # Allow all headers
+    )
+
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI()
 
 class SearchRequest(BaseModel):
     youtube_url: str
@@ -100,7 +114,9 @@ async def search_transcript(data: SearchRequest):
         # Get input video title
         input_video_title = youtube_service.get_video_title(video_id)
         
-        # Index video if not already indexed
+        # Index video if not adeo after ensuring indexing is complete
+        results = youtube_service.search_video_content(data.query, video_id, top_k=data.top_k)
+        
         if not youtube_service.is_video_indexed(video_id):
             print("⚙️ Indexing new video transcript before search...")
             success = youtube_service.index_video(data.youtube_url, video_id)
@@ -108,9 +124,7 @@ async def search_transcript(data: SearchRequest):
                 raise HTTPException(status_code=500, detail="Failed to index video transcript")
             print("✅ Indexing done. Proceeding to search.")
         
-        # Search input video after ensuring indexing is complete
-        results = youtube_service.search_video_content(data.query, video_id, top_k=data.top_k)
-        
+        # Search input vi
         # Format input video results
         input_video_segments = []
         for r in results:

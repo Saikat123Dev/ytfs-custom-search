@@ -376,7 +376,7 @@ function App() {
         </div>
       )}
 
-      {/* Search Results */}
+     <div className='space-y-3 max-h-80 overflow-y-auto pr-2'>
       {searchResults.length > 0 && (
         <div className="mb-6">
           <div className="flex items-center justify-between mb-3">
@@ -432,6 +432,7 @@ function App() {
           </div>
         </div>
       )}
+      </div>
 
       {/* Preview Toggle */}
       {isValidLink && (

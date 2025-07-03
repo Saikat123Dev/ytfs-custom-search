@@ -25,8 +25,6 @@ app.add_middleware(
         allow_headers=["*"],     # Allow all headers
     )
 
-
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -77,8 +75,8 @@ def search_youtube_videos(query: str, max_results: int = 5):
         logger.error(f"YouTube search error: {e}")
         return []
 
-def process_related_video_segments(video_info: dict, query: str, top_k: int = 3):
-    """Process segments for a related video"""
+def process_related_video_segments(video_info: dict, query: str, top_k: int = 1):
+    """Process segments for a related video - returns exactly one best match"""
     try:
         video_id = video_info['video_id']
         video_url = video_info['url']
@@ -87,23 +85,25 @@ def process_related_video_segments(video_info: dict, query: str, top_k: int = 3)
         if not youtube_service.is_video_indexed(video_id):
             youtube_service.index_video(video_url, video_id)
         
-        # Search segments
-        results = youtube_service.search_video_content(query, video_id, top_k=top_k)
+        # Search segments - we only want the top 1 result
+        results = youtube_service.search_video_content(query, video_id, top_k=1)
         
-        formatted_segments = []
-        for r in results:
+        # Return only the best match if found
+        if results:
+            r = results[0]  # Take only the first (best) result
             snippet = " ".join(r['text'].split()[:25]) + "..."
-            formatted_segments.append({
+            return {
                 "timestamp": int(r["start"]),
                 "snippet": snippet,
                 "url": r["url"],
                 "score": round(r["score"], 4)
-            })
-        
-        return formatted_segments
+            }
+        else:
+            return None
+            
     except Exception as e:
         logger.error(f"Error processing related video {video_id}: {e}")
-        return []
+        return None
 
 @app.post("/search")
 async def search_transcript(data: SearchRequest):
@@ -114,9 +114,7 @@ async def search_transcript(data: SearchRequest):
         # Get input video title
         input_video_title = youtube_service.get_video_title(video_id)
         
-        # Index video if not adeo after ensuring indexing is complete
-        results = youtube_service.search_video_content(data.query, video_id, top_k=data.top_k)
-        
+        # Index video if not already indexed
         if not youtube_service.is_video_indexed(video_id):
             print("⚙️ Indexing new video transcript before search...")
             success = youtube_service.index_video(data.youtube_url, video_id)
@@ -124,7 +122,9 @@ async def search_transcript(data: SearchRequest):
                 raise HTTPException(status_code=500, detail="Failed to index video transcript")
             print("✅ Indexing done. Proceeding to search.")
         
-        # Search input vi
+        # Search input video after ensuring indexing is complete
+        results = youtube_service.search_video_content(data.query, video_id, top_k=data.top_k)
+        
         # Format input video results
         input_video_segments = []
         for r in results:
@@ -157,19 +157,21 @@ async def search_transcript(data: SearchRequest):
             
             related_videos_with_segments = []
             for video in related_videos:
-                # Process segments for each related video
-                segments = process_related_video_segments(video, data.query, top_k=3)
+                # Process segments for each related video - get only the best match
+                best_segment = process_related_video_segments(video, data.query, top_k=1)
                 
-                related_videos_with_segments.append({
-                    "video_id": video['video_id'],
-                    "title": video['title'],
-                    "channel_title": video['channel_title'],
-                    "description": video['description'][:200] + "..." if len(video['description']) > 200 else video['description'],
-                    "published_at": video['published_at'],
-                    "url": video['url'],
-                    "segments": segments,
-                    "segments_found": len(segments)
-                })
+                # Only include videos where we found at least one relevant segment
+                if best_segment:
+                    related_videos_with_segments.append({
+                        "video_id": video['video_id'],
+                        "title": video['title'],
+                        "channel_title": video['channel_title'],
+                        "description": video['description'][:200] + "..." if len(video['description']) > 200 else video['description'],
+                        "published_at": video['published_at'],
+                        "url": video['url'],
+                        "best_segment": best_segment,  # Changed from "segments" to "best_segment"
+                        "has_relevant_content": True
+                    })
             
             response["related_videos"] = related_videos_with_segments
             response["total_related_videos"] = len(related_videos_with_segments)

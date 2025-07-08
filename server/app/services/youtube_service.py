@@ -4,6 +4,8 @@ import uuid
 import logging
 import numpy as np
 import pyarrow as pa
+import time
+import random
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -16,6 +18,9 @@ from googleapiclient.errors import HttpError
 import google.generativeai as genai
 import voyageai
 import lancedb
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Load environment variables
 load_dotenv()
@@ -49,14 +54,52 @@ try:
 except ValueError:
     logger.info("Table 'transcripts' not found. Creating new table.")
     try:
-        # Try to drop table if it exists (but ignore if it doesn't)
         db.drop_table("transcripts", ignore_missing=True)
     except Exception as e:
         logger.debug(f"Error dropping table (this is expected if table doesn't exist): {e}")
     
-    # Create new table
     table = db.create_table("transcripts", schema=schema)
     logger.info("Successfully created 'transcripts' table.")
+
+
+class RateLimitedSession:
+    """Session with rate limiting and retry logic"""
+    
+    def __init__(self, requests_per_minute: int = 30):
+        self.requests_per_minute = requests_per_minute
+        self.min_interval = 60.0 / requests_per_minute
+        self.last_request_time = 0
+        
+        # Create session with retry strategy
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Set user agent to mimic browser
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+    
+    def wait_if_needed(self):
+        """Wait if we need to respect rate limits"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        if time_since_last < self.min_interval:
+            wait_time = self.min_interval - time_since_last
+            # Add some jitter to avoid thundering herd
+            wait_time += random.uniform(0, 0.5)
+            logger.info(f"Rate limiting: waiting {wait_time:.2f} seconds")
+            time.sleep(wait_time)
+        
+        self.last_request_time = time.time()
 
 
 class TranscriptSegment:
@@ -74,6 +117,12 @@ class YouTubeWorkflowService:
         else:
             self.youtube = None
             logger.warning("YouTube API key not found. Suggestions feature will be limited.")
+        
+        # Initialize rate-limited session
+        self.rate_limiter = RateLimitedSession(requests_per_minute=20)  # Conservative rate limit
+        
+        # Track failed videos to avoid repeated attempts
+        self.failed_videos = set()
 
     def extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL"""
@@ -92,159 +141,130 @@ class YouTubeWorkflowService:
         
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
 
-    def get_available_transcripts(self, video_id: str) -> Dict[str, Any]:
-        """Get information about available transcripts for debugging"""
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            available = {}
-            
-            for transcript in transcript_list:
-                available[transcript.language] = {
-                    'language': transcript.language,
-                    'language_code': transcript.language_code,
-                    'is_generated': transcript.is_generated,
-                    'is_translatable': transcript.is_translatable
-                }
-            
-            return available
-        except Exception as e:
-            logger.error(f"Error getting transcript list: {e}")
-            return {}
+    def exponential_backoff_retry(self, func, max_retries: int = 5, base_delay: float = 1.0):
+        """Retry function with exponential backoff"""
+        for attempt in range(max_retries):
+            try:
+                return func()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"Rate limited. Retrying in {delay:.2f} seconds (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                else:
+                    # For non-rate-limit errors, fail fast
+                    raise e
 
-    def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
-        """Get transcript segments from YouTube video with improved error handling"""
-        video_id = self.extract_video_id(youtube_url)
+    def get_transcript_with_fallback(self, video_id: str) -> List[TranscriptSegment]:
+        """Get transcript with multiple fallback methods and proper rate limiting"""
         
-        # Language preference order (add more as needed)
-        language_preferences = ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU']
+        # Check if we've already failed on this video recently
+        if video_id in self.failed_videos:
+            logger.info(f"Skipping video {video_id} - previously failed")
+            raise ValueError(f"Video {video_id} previously failed transcript extraction")
         
-        try:
-            # First, try to get transcript list to see what's available
-            logger.info(f"Checking available transcripts for video {video_id}...")
-            available_transcripts = self.get_available_transcripts(video_id)
+        # Apply rate limiting
+        self.rate_limiter.wait_if_needed()
+        
+        def attempt_transcript_fetch():
+            # Language preference order
+            language_preferences = ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU']
             
-            if available_transcripts:
-                logger.info(f"Available transcripts: {list(available_transcripts.keys())}")
-            else:
-                logger.warning(f"No transcript information available for video {video_id}")
+            logger.info(f"Attempting to fetch transcript for video {video_id}")
             
-            # Try different approaches to get transcript
-            raw_transcript = None
-            transcript_source = None
-            
-            # Method 1: Try preferred languages
+            # Method 1: Try preferred languages with retries
             for lang in language_preferences:
                 try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
-                    transcript_source = f"Language: {lang}"
+                    logger.info(f"Trying language: {lang}")
+                    raw_transcript = YouTubeTranscriptApi.get_transcript(
+                        video_id, 
+                        languages=[lang],
+                        preserve_formatting=True
+                    )
                     logger.info(f"Successfully retrieved transcript in {lang}")
-                    break
-                except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
+                    return raw_transcript, f"Language: {lang}"
+                except (NoTranscriptFound, TranscriptsDisabled):
                     continue
                 except Exception as e:
+                    if "429" in str(e):
+                        raise e  # Let the retry mechanism handle this
                     logger.warning(f"Error with language {lang}: {e}")
                     continue
             
-            # Method 2: Try without language specification (auto-detect)
-            if raw_transcript is None:
-                try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                    transcript_source = "Auto-detected language"
-                    logger.info("Successfully retrieved transcript with auto-detection")
-                except Exception as e:
-                    logger.warning(f"Auto-detection failed: {e}")
+            # Method 2: Auto-detect language
+            try:
+                logger.info("Trying auto-detection")
+                raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                logger.info("Successfully retrieved transcript with auto-detection")
+                return raw_transcript, "Auto-detected"
+            except Exception as e:
+                if "429" in str(e):
+                    raise e
+                logger.warning(f"Auto-detection failed: {e}")
             
-            # Method 3: Try to get any available transcript
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                    # Get the first available transcript
-                    for transcript in transcript_list:
-                        try:
-                            raw_transcript = transcript.fetch()
-                            transcript_source = f"First available: {transcript.language_code}"
-                            logger.info(f"Retrieved transcript in {transcript.language_code}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch {transcript.language_code}: {e}")
-                            continue
-                except Exception as e:
-                    logger.error(f"Failed to list transcripts: {e}")
+            # Method 3: Get first available transcript
+            try:
+                logger.info("Trying first available transcript")
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                for transcript in transcript_list:
+                    try:
+                        raw_transcript = transcript.fetch()
+                        logger.info(f"Retrieved transcript in {transcript.language_code}")
+                        return raw_transcript, f"Available: {transcript.language_code}"
+                    except Exception as e:
+                        if "429" in str(e):
+                            raise e
+                        continue
+            except Exception as e:
+                if "429" in str(e):
+                    raise e
+                logger.warning(f"Failed to get available transcripts: {e}")
             
-            # Method 4: Try to get generated transcript if manual not available
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                    for transcript in transcript_list:
-                        if transcript.is_generated:
-                            try:
-                                raw_transcript = transcript.fetch()
-                                transcript_source = f"Generated: {transcript.language_code}"
-                                logger.info(f"Retrieved generated transcript in {transcript.language_code}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch generated transcript {transcript.language_code}: {e}")
-                                continue
-                except Exception as e:
-                    logger.error(f"Failed to get generated transcripts: {e}")
+            # If all methods fail
+            raise ValueError(f"No transcript available for video {video_id}")
+        
+        try:
+            # Use exponential backoff retry
+            raw_transcript, source = self.exponential_backoff_retry(
+                attempt_transcript_fetch,
+                max_retries=3,
+                base_delay=2.0
+            )
             
-            # If we still don't have a transcript, try translated versions
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                    for transcript in transcript_list:
-                        if transcript.is_translatable:
-                            try:
-                                # Try to translate to English
-                                translated = transcript.translate('en')
-                                raw_transcript = translated.fetch()
-                                transcript_source = f"Translated to English from {transcript.language_code}"
-                                logger.info(f"Retrieved translated transcript from {transcript.language_code}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to translate from {transcript.language_code}: {e}")
-                                continue
-                except Exception as e:
-                    logger.error(f"Failed to get translatable transcripts: {e}")
+            if not raw_transcript:
+                raise ValueError(f"Empty transcript for video {video_id}")
             
-            if raw_transcript is None:
-                # Provide detailed error information
-                error_msg = f"Could not retrieve transcript for video {video_id}. "
-                if available_transcripts:
-                    error_msg += f"Available languages: {list(available_transcripts.keys())}. "
-                else:
-                    error_msg += "No transcripts appear to be available. "
-                error_msg += "This could be due to: 1) Transcripts disabled by uploader, 2) Video is too new, 3) Video is private/restricted, 4) Regional restrictions."
-                raise ValueError(error_msg)
-            
-            logger.info(f"Transcript retrieved via: {transcript_source}")
-            logger.info(f"Transcript contains {len(raw_transcript)} segments")
+            logger.info(f"Transcript source: {source}, segments: {len(raw_transcript)}")
             
             # Convert to TranscriptSegment objects
             segments = []
             for segment in raw_transcript:
-                # Handle potential missing keys
                 text = segment.get('text', '').strip()
                 start = float(segment.get('start', 0))
                 duration = float(segment.get('duration', 0))
                 
-                if text:  # Only add segments with actual text
+                if text:
                     segments.append(TranscriptSegment(text=text, start=start, duration=duration))
             
             if not segments:
-                raise ValueError(f"Transcript retrieved but contains no valid text segments for video {video_id}")
+                raise ValueError(f"No valid segments found for video {video_id}")
             
-            logger.info(f"Successfully processed {len(segments)} transcript segments")
+            logger.info(f"Successfully processed {len(segments)} segments")
             return segments
             
-        except (VideoUnavailable, TranscriptsDisabled, NoTranscriptFound) as e:
-            error_msg = f"Transcript unavailable for video {video_id}: {str(e)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
         except Exception as e:
-            error_msg = f"Unexpected error getting transcript for video {video_id}: {str(e)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            # Add to failed videos to avoid retrying
+            self.failed_videos.add(video_id)
+            logger.error(f"Failed to get transcript for video {video_id}: {e}")
+            raise
+
+    def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
+        """Main transcript retrieval method"""
+        video_id = self.extract_video_id(youtube_url)
+        return self.get_transcript_with_fallback(video_id)
 
     def chunk_transcript(self, segments: List[TranscriptSegment]) -> List[Document]:
         """Chunk transcript into manageable pieces for embedding"""
@@ -255,7 +275,11 @@ class YouTubeWorkflowService:
         full_text = "\n".join(f"{i}|{seg.start}|{seg.duration}|{seg.text}" 
                              for i, seg in enumerate(segments))
         
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, 
+            chunk_overlap=100,  # Increased overlap
+            separators=["\n", ".", "!", "?", ",", " "]
+        )
         raw_chunks = splitter.split_text(full_text)
 
         documents = []
@@ -303,28 +327,40 @@ class YouTubeWorkflowService:
                 logger.warning("Empty text provided for embedding")
                 return [0.0] * embedding_dim
             
-            result = genai.embed_content(
-                model="models/embedding-001",
-                content=text,
-                task_type=task_type
-            )
-            embedding = result["embedding"]
+            # Add retry logic for embedding API
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    result = genai.embed_content(
+                        model="models/embedding-001",
+                        content=text,
+                        task_type=task_type
+                    )
+                    embedding = result["embedding"]
+                    
+                    # Ensure correct dimension
+                    if len(embedding) != embedding_dim:
+                        raise ValueError(f"Embedding dimension mismatch: expected {embedding_dim}, got {len(embedding)}")
+                    
+                    return embedding
+                    
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    logger.warning(f"Embedding attempt {attempt + 1} failed: {e}")
+                    time.sleep(2 ** attempt)  # Exponential backoff
             
-            # Ensure correct dimension
-            if len(embedding) != embedding_dim:
-                raise ValueError(f"Embedding dimension mismatch: expected {embedding_dim}, got {len(embedding)}")
-            
-            return embedding
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
             # Return zero vector as fallback
             return [0.0] * embedding_dim
 
-    def embed_texts_batch(self, texts: List[str], max_workers: int = 5) -> List[List[float]]:
-        """Generate embeddings for multiple texts using threading"""
+    def embed_texts_batch(self, texts: List[str], max_workers: int = 3) -> List[List[float]]:
+        """Generate embeddings for multiple texts with reduced concurrency"""
         if not texts:
             return []
         
+        # Reduced max_workers to avoid overwhelming the API
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self.embed_text, text): i for i, text in enumerate(texts)}
             embeddings = [None] * len(texts)
@@ -335,8 +371,10 @@ class YouTubeWorkflowService:
                     embeddings[index] = future.result()
                 except Exception as e:
                     logger.error(f"Failed to embed text at index {index}: {e}")
-                    # Use zero vector as fallback
                     embeddings[index] = [0.0] * embedding_dim
+                
+                # Small delay between embedding requests
+                time.sleep(0.1)
             
             return embeddings
 
@@ -350,13 +388,15 @@ class YouTubeWorkflowService:
             return False
 
     def index_video(self, youtube_url: str, video_id: str) -> bool:
-        """Index a video's transcript in the database"""
+        """Index a video's transcript in the database with improved error handling"""
         if self.is_video_indexed(video_id):
             logger.info(f"Video {video_id} is already indexed.")
             return True
 
         try:
-            logger.info(f"Getting transcript for video {video_id}...")
+            logger.info(f"Starting indexing process for video {video_id}")
+            
+            # Get transcript with retries and rate limiting
             segments = self.get_transcript(youtube_url)
             
             if not segments:
@@ -377,7 +417,7 @@ class YouTubeWorkflowService:
             # Prepare data for insertion
             data = []
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                if embedding and any(x != 0.0 for x in embedding):  # Skip zero embeddings
+                if embedding and any(x != 0.0 for x in embedding):
                     data.append({
                         "id": str(uuid.uuid4()),
                         "video_id": video_id,
@@ -414,7 +454,7 @@ class YouTubeWorkflowService:
             results = (
                 table.search(query_embedding, vector_column_name="vector")
                 .where(f"video_id = '{video_id}'")
-                .limit(top_k * 2)  # Get more results for reranking
+                .limit(top_k * 2)
                 .to_list()
             )
             
@@ -446,12 +486,11 @@ class YouTubeWorkflowService:
                 
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
-                # Fallback to original results without reranking
                 return [{
                     "text": doc["text"],
                     "start": doc["start"],
                     "duration": doc["duration"],
-                    "score": 1.0 - (i * 0.1),  # Simple fallback scoring
+                    "score": 1.0 - (i * 0.1),
                     "url": f"https://www.youtube.com/watch?v={video_id}&t={int(doc['start'])}s"
                 } for i, doc in enumerate(results[:top_k])]
 
@@ -514,6 +553,11 @@ class YouTubeWorkflowService:
             logger.error(f"Error getting video title: {e}")
             return f"Video {video_id}"
 
+    def clear_failed_videos(self):
+        """Clear the failed videos cache"""
+        self.failed_videos.clear()
+        logger.info("Cleared failed videos cache")
+
 
 def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
     """Print formatted video segments"""
@@ -528,7 +572,6 @@ def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
     print("-" * 60)
 
     for i, segment in enumerate(segments, 1):
-        # Truncate text for display
         text_preview = " ".join(segment['text'].split()[:30])
         if len(segment['text'].split()) > 30:
             text_preview += "..."
@@ -549,7 +592,6 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
     print("-" * 60)
 
     for i, video in enumerate(videos, 1):
-        # Truncate description
         desc_preview = video['description'][:100]
         if len(video['description']) > 100:
             desc_preview += "..."
@@ -561,3 +603,19 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
         print(f"   🔗 {video['url']}")
 
 
+# Example usage with better error handling
+if __name__ == "__main__":
+    service = YouTubeWorkflowService()
+    
+    # Example: Index a video with proper error handling
+    try:
+        video_url = "https://www.youtube.com/watch?v=your_video_id"
+        video_id = service.extract_video_id(video_url)
+        
+        if service.index_video(video_url, video_id):
+            print(f"✅ Successfully indexed video {video_id}")
+        else:
+            print(f"❌ Failed to index video {video_id}")
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")

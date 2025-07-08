@@ -63,50 +63,122 @@ except ValueError:
 
 
 class RateLimitedSession:
-    """Session with rate limiting and retry logic"""
+    """Enhanced session with advanced rate limiting and anti-bot detection"""
     
-    def __init__(self, requests_per_minute: int = 30):
+    def __init__(self, requests_per_minute: int = 15):  # Reduced from 30 to 15
         self.requests_per_minute = requests_per_minute
         self.min_interval = 60.0 / requests_per_minute
         self.last_request_time = 0
+        self.request_count = 0
+        self.session_start_time = time.time()
         
-        # Create session with retry strategy
+        # Create session with enhanced retry strategy
         self.session = requests.Session()
         retry_strategy = Retry(
             total=5,
-            backoff_factor=2,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"]
+            backoff_factor=3,  # Increased from 2 to 3
+            status_forcelist=[429, 500, 502, 503, 504, 403],  # Added 403
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
-        # Set user agent to mimic browser
+        # Enhanced headers to mimic real browser behavior
+        self.update_headers()
+        
+        # Connection pooling settings
+        self.session.keep_alive = False
+    
+    def update_headers(self):
+        """Update headers with realistic browser simulation"""
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
+        ]
+        
+        accept_languages = [
+            'en-US,en;q=0.9',
+            'en-GB,en;q=0.9',
+            'en-US,en;q=0.8,es;q=0.7',
+            'en-GB,en-US;q=0.8,en;q=0.7'
+        ]
+        
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': random.choice(user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': random.choice(accept_languages),
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Charset': 'UTF-8,*;q=0.7',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'DNT': '1',
+            'Sec-GPC': '1'
         })
     
     def wait_if_needed(self):
-        """Wait if we need to respect rate limits"""
+        """Enhanced wait logic with progressive delays"""
         current_time = time.time()
         time_since_last = current_time - self.last_request_time
         
-        if time_since_last < self.min_interval:
-            wait_time = self.min_interval - time_since_last
-            # Add some jitter to avoid thundering herd
-            wait_time += random.uniform(0, 0.5)
-            logger.info(f"Rate limiting: waiting {wait_time:.2f} seconds")
+        # Progressive delay based on request count
+        base_delay = self.min_interval
+        if self.request_count > 50:
+            base_delay *= 2
+        elif self.request_count > 100:
+            base_delay *= 3
+        
+        if time_since_last < base_delay:
+            wait_time = base_delay - time_since_last
+            # Add more jitter to avoid detection
+            wait_time += random.uniform(0.5, 2.0)
+            logger.info(f"Rate limiting: waiting {wait_time:.2f} seconds (request #{self.request_count})")
             time.sleep(wait_time)
         
+        # Additional random delay every 10 requests
+        if self.request_count % 10 == 0 and self.request_count > 0:
+            extra_delay = random.uniform(2.0, 5.0)
+            logger.info(f"Extra delay: {extra_delay:.2f} seconds")
+            time.sleep(extra_delay)
+            
+        # Update headers occasionally to simulate browser behavior
+        if self.request_count % 25 == 0:
+            self.update_headers()
+            logger.info("Updated headers to simulate new browser session")
+        
         self.last_request_time = time.time()
-
-
-class TranscriptSegment:
-    def __init__(self, text: str, start: float, duration: float):
-        self.text = text
-        self.start = start
-        self.duration = duration
+        self.request_count += 1
+    
+    def make_request(self, url: str, **kwargs) -> requests.Response:
+        """Make a request with all anti-detection measures"""
+        self.wait_if_needed()
+        
+        # Add random delay before actual request
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        try:
+            response = self.session.get(url, timeout=30, **kwargs)
+            
+            # Check for rate limiting
+            if response.status_code == 429:
+                logger.warning("Rate limited, backing off significantly")
+                time.sleep(random.uniform(30, 60))
+                raise requests.exceptions.RetryError("Rate limited")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Request failed: {e}")
+            raise
 
 
 class YouTubeWorkflowService:
@@ -118,11 +190,13 @@ class YouTubeWorkflowService:
             self.youtube = None
             logger.warning("YouTube API key not found. Suggestions feature will be limited.")
         
-        # Initialize rate-limited session
-        self.rate_limiter = RateLimitedSession(requests_per_minute=20)  # Conservative rate limit
+        # Initialize enhanced rate-limited session
+        self.rate_limiter = RateLimitedSession(requests_per_minute=10)  # Very conservative
         
         # Track failed videos to avoid repeated attempts
         self.failed_videos = set()
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 3
 
     def extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL"""
@@ -141,25 +215,40 @@ class YouTubeWorkflowService:
         
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
 
-    def exponential_backoff_retry(self, func, max_retries: int = 5, base_delay: float = 1.0):
-        """Retry function with exponential backoff"""
+    def exponential_backoff_retry(self, func, max_retries: int = 3, base_delay: float = 2.0):
+        """Enhanced retry function with circuit breaker pattern"""
+        
+        # Circuit breaker: if too many consecutive failures, pause longer
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            logger.warning(f"Circuit breaker activated. Pausing for 5 minutes after {self.consecutive_failures} failures")
+            time.sleep(300)  # 5 minutes
+            self.consecutive_failures = 0
+        
         for attempt in range(max_retries):
             try:
-                return func()
+                result = func()
+                self.consecutive_failures = 0  # Reset on success
+                return result
             except Exception as e:
+                self.consecutive_failures += 1
+                
                 if attempt == max_retries - 1:
+                    logger.error(f"All retry attempts failed. Consecutive failures: {self.consecutive_failures}")
                     raise e
                 
-                if "429" in str(e) or "Too Many Requests" in str(e):
-                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                if any(phrase in str(e).lower() for phrase in ["429", "too many requests", "rate limit", "quota"]):
+                    # Much longer delay for rate limit errors
+                    delay = base_delay * (3 ** attempt) + random.uniform(5, 15)
                     logger.warning(f"Rate limited. Retrying in {delay:.2f} seconds (attempt {attempt + 1}/{max_retries})")
                     time.sleep(delay)
                 else:
-                    # For non-rate-limit errors, fail fast
-                    raise e
+                    # Standard backoff for other errors
+                    delay = base_delay * (2 ** attempt) + random.uniform(1, 3)
+                    logger.warning(f"Error occurred. Retrying in {delay:.2f} seconds: {e}")
+                    time.sleep(delay)
 
     def get_transcript_with_fallback(self, video_id: str) -> List[TranscriptSegment]:
-        """Get transcript with multiple fallback methods and proper rate limiting"""
+        """Get transcript with enhanced anti-detection measures"""
         
         # Check if we've already failed on this video recently
         if video_id in self.failed_videos:
@@ -175,10 +264,18 @@ class YouTubeWorkflowService:
             
             logger.info(f"Attempting to fetch transcript for video {video_id}")
             
+            # Add random delay to simulate human behavior
+            time.sleep(random.uniform(1, 3))
+            
             # Method 1: Try preferred languages with retries
             for lang in language_preferences:
                 try:
                     logger.info(f"Trying language: {lang}")
+                    
+                    # Additional delay between language attempts
+                    if lang != language_preferences[0]:
+                        time.sleep(random.uniform(2, 4))
+                    
                     raw_transcript = YouTubeTranscriptApi.get_transcript(
                         video_id, 
                         languages=[lang],
@@ -186,40 +283,49 @@ class YouTubeWorkflowService:
                     )
                     logger.info(f"Successfully retrieved transcript in {lang}")
                     return raw_transcript, f"Language: {lang}"
+                    
                 except (NoTranscriptFound, TranscriptsDisabled):
                     continue
                 except Exception as e:
-                    if "429" in str(e):
-                        raise e  # Let the retry mechanism handle this
+                    if any(phrase in str(e).lower() for phrase in ["429", "too many requests", "rate limit"]):
+                        logger.warning(f"Rate limited on language {lang}, waiting longer...")
+                        time.sleep(random.uniform(30, 60))
+                        raise e
                     logger.warning(f"Error with language {lang}: {e}")
                     continue
             
-            # Method 2: Auto-detect language
+            # Method 2: Auto-detect language with longer delay
             try:
                 logger.info("Trying auto-detection")
+                time.sleep(random.uniform(3, 6))
                 raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
                 logger.info("Successfully retrieved transcript with auto-detection")
                 return raw_transcript, "Auto-detected"
             except Exception as e:
-                if "429" in str(e):
+                if any(phrase in str(e).lower() for phrase in ["429", "too many requests", "rate limit"]):
+                    logger.warning("Rate limited on auto-detection")
+                    time.sleep(random.uniform(30, 60))
                     raise e
                 logger.warning(f"Auto-detection failed: {e}")
             
             # Method 3: Get first available transcript
             try:
                 logger.info("Trying first available transcript")
+                time.sleep(random.uniform(2, 5))
                 transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                
                 for transcript in transcript_list:
                     try:
+                        time.sleep(random.uniform(1, 2))
                         raw_transcript = transcript.fetch()
                         logger.info(f"Retrieved transcript in {transcript.language_code}")
                         return raw_transcript, f"Available: {transcript.language_code}"
                     except Exception as e:
-                        if "429" in str(e):
+                        if any(phrase in str(e).lower() for phrase in ["429", "too many requests", "rate limit"]):
                             raise e
                         continue
             except Exception as e:
-                if "429" in str(e):
+                if any(phrase in str(e).lower() for phrase in ["429", "too many requests", "rate limit"]):
                     raise e
                 logger.warning(f"Failed to get available transcripts: {e}")
             
@@ -227,11 +333,11 @@ class YouTubeWorkflowService:
             raise ValueError(f"No transcript available for video {video_id}")
         
         try:
-            # Use exponential backoff retry
+            # Use enhanced exponential backoff retry
             raw_transcript, source = self.exponential_backoff_retry(
                 attempt_transcript_fetch,
-                max_retries=3,
-                base_delay=2.0
+                max_retries=2,  # Reduced retries
+                base_delay=5.0  # Increased base delay
             )
             
             if not raw_transcript:
@@ -261,11 +367,6 @@ class YouTubeWorkflowService:
             logger.error(f"Failed to get transcript for video {video_id}: {e}")
             raise
 
-    def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
-        """Main transcript retrieval method"""
-        video_id = self.extract_video_id(youtube_url)
-        return self.get_transcript_with_fallback(video_id)
-
     def chunk_transcript(self, segments: List[TranscriptSegment]) -> List[Document]:
         """Chunk transcript into manageable pieces for embedding"""
         if not segments:
@@ -277,7 +378,7 @@ class YouTubeWorkflowService:
         
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, 
-            chunk_overlap=100,  # Increased overlap
+            chunk_overlap=100,
             separators=["\n", ".", "!", "?", ",", " "]
         )
         raw_chunks = splitter.split_text(full_text)
@@ -321,16 +422,22 @@ class YouTubeWorkflowService:
         return documents
 
     def embed_text(self, text: str, task_type: str = "retrieval_document") -> List[float]:
-        """Generate embeddings for text using Google's embedding model"""
+        """Generate embeddings for text using Google's embedding model with enhanced error handling"""
         try:
             if not text.strip():
                 logger.warning("Empty text provided for embedding")
                 return [0.0] * embedding_dim
             
-            # Add retry logic for embedding API
+            # Add retry logic for embedding API with longer delays
             max_retries = 3
             for attempt in range(max_retries):
                 try:
+                    # Add delay before embedding requests
+                    if attempt > 0:
+                        delay = (2 ** attempt) * 3 + random.uniform(1, 3)
+                        logger.info(f"Embedding retry delay: {delay:.2f} seconds")
+                        time.sleep(delay)
+                    
                     result = genai.embed_content(
                         model="models/embedding-001",
                         content=text,
@@ -346,37 +453,42 @@ class YouTubeWorkflowService:
                     
                 except Exception as e:
                     if attempt == max_retries - 1:
+                        logger.error(f"All embedding attempts failed: {e}")
                         raise e
                     logger.warning(f"Embedding attempt {attempt + 1} failed: {e}")
-                    time.sleep(2 ** attempt)  # Exponential backoff
             
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
             # Return zero vector as fallback
             return [0.0] * embedding_dim
 
-    def embed_texts_batch(self, texts: List[str], max_workers: int = 3) -> List[List[float]]:
-        """Generate embeddings for multiple texts with reduced concurrency"""
+    def embed_texts_batch(self, texts: List[str], max_workers: int = 2) -> List[List[float]]:
+        """Generate embeddings for multiple texts with very conservative concurrency"""
         if not texts:
             return []
         
-        # Reduced max_workers to avoid overwhelming the API
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.embed_text, text): i for i, text in enumerate(texts)}
-            embeddings = [None] * len(texts)
-            
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    embeddings[index] = future.result()
-                except Exception as e:
-                    logger.error(f"Failed to embed text at index {index}: {e}")
-                    embeddings[index] = [0.0] * embedding_dim
+        # Further reduced max_workers and added delays
+        embeddings = []
+        
+        # Process sequentially to avoid overwhelming APIs
+        for i, text in enumerate(texts):
+            try:
+                # Add delay between each embedding request
+                if i > 0:
+                    time.sleep(random.uniform(1, 3))
                 
-                # Small delay between embedding requests
-                time.sleep(0.1)
-            
-            return embeddings
+                embedding = self.embed_text(text)
+                embeddings.append(embedding)
+                
+                # Progress logging
+                if (i + 1) % 5 == 0:
+                    logger.info(f"Processed {i + 1}/{len(texts)} embeddings")
+                    
+            except Exception as e:
+                logger.error(f"Failed to embed text at index {i}: {e}")
+                embeddings.append([0.0] * embedding_dim)
+        
+        return embeddings
 
     def is_video_indexed(self, video_id: str) -> bool:
         """Check if video is already indexed in the database"""
@@ -388,13 +500,16 @@ class YouTubeWorkflowService:
             return False
 
     def index_video(self, youtube_url: str, video_id: str) -> bool:
-        """Index a video's transcript in the database with improved error handling"""
+        """Index a video's transcript in the database with enhanced error handling"""
         if self.is_video_indexed(video_id):
             logger.info(f"Video {video_id} is already indexed.")
             return True
 
         try:
             logger.info(f"Starting indexing process for video {video_id}")
+            
+            # Add initial delay to avoid burst requests
+            time.sleep(random.uniform(2, 5))
             
             # Get transcript with retries and rate limiting
             segments = self.get_transcript(youtube_url)
@@ -505,6 +620,9 @@ class YouTubeWorkflowService:
             return []
 
         try:
+            # Add delay before API call
+            time.sleep(random.uniform(1, 2))
+            
             search_response = self.youtube.search().list(
                 part='id,snippet',
                 q=query,
@@ -539,6 +657,9 @@ class YouTubeWorkflowService:
             return f"Video {video_id}"
 
         try:
+            # Add delay before API call
+            time.sleep(random.uniform(0.5, 1.5))
+            
             response = self.youtube.videos().list(
                 part='snippet',
                 id=video_id
@@ -556,7 +677,24 @@ class YouTubeWorkflowService:
     def clear_failed_videos(self):
         """Clear the failed videos cache"""
         self.failed_videos.clear()
-        logger.info("Cleared failed videos cache")
+        self.consecutive_failures = 0
+        logger.info("Cleared failed videos cache and reset failure counter")
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get service health status"""
+        return {
+            "consecutive_failures": self.consecutive_failures,
+            "failed_videos_count": len(self.failed_videos),
+            "request_count": self.rate_limiter.request_count,
+            "session_uptime": time.time() - self.rate_limiter.session_start_time
+        }
+
+
+class TranscriptSegment:
+    def __init__(self, text: str, start: float, duration: float):
+        self.text = text
+        self.start = start
+        self.duration = duration
 
 
 def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
@@ -603,19 +741,4 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
         print(f"   🔗 {video['url']}")
 
 
-# Example usage with better error handling
-if __name__ == "__main__":
-    service = YouTubeWorkflowService()
-    
-    # Example: Index a video with proper error handling
-    try:
-        video_url = "https://www.youtube.com/watch?v=your_video_id"
-        video_id = service.extract_video_id(video_url)
-        
-        if service.index_video(video_url, video_id):
-            print(f"✅ Successfully indexed video {video_id}")
-        else:
-            print(f"❌ Failed to index video {video_id}")
-            
-    except Exception as e:
-        print(f"❌ Error: {e}")
+# Example usage with enhanced error handling

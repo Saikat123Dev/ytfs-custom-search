@@ -447,7 +447,7 @@ class YouTubeWorkflowService:
             # Add initial delay to avoid burst requests
             time.sleep(random.uniform(2, 5))
             # Get transcript with retries and rate limiting
-            segments = self.get_transcript(youtube_url)
+            segments = self.get_transcript_with_fallback(youtube_url)
             if not segments:
                 logger.warning(f"No transcript segments found for video {video_id}")
                 return False

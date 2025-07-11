@@ -10,7 +10,7 @@ import logging
 import uvicorn
 
 # Import the correct class name from your service
-from services.youtube_service import YouTubeTranscriptService  # Updated import to relative
+from app.youtube_service import YouTubeTranscriptService  # Updated import to relative
 
 app = FastAPI()
 

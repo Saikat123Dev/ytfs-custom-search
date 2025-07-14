@@ -9,23 +9,21 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
 
-# Import the correct class name from your service
-from app.services.youtube_service import YouTubeTranscriptService  # Updated import to relative
-
+from services.youtube_service import YouTubeWorkflowService
 app = FastAPI()
 
 origins = [
-    "http://localhost:3000",  # Example: Your frontend development server
-    "http://localhost:5173",  # Example: Your deployed frontend
-    # Add other allowed origins as needed
-]
+        "http://localhost:3000",  # Example: Your frontend development server
+        "http://localhost:5173", # Example: Your deployed frontend
+        # Add other allowed origins as needed
+    ]
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,  # Allow cookies and authorization headers
-    allow_methods=["*"],     # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"],     # Allow all headers
-)
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,  # Allow cookies and authorization headers
+        allow_methods=["*"],     # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
+        allow_headers=["*"],     # Allow all headers
+    )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,8 +35,45 @@ class SearchRequest(BaseModel):
     top_k: int = 5
     max_related_videos: int = 5
 
-# Initialize YouTube service with correct class name
-youtube_service = YouTubeTranscriptService()
+# Initialize YouTube service
+youtube_service = YouTubeWorkflowService()
+
+def get_youtube_service():
+    """Initialize YouTube API service"""
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if api_key:
+        return build('youtube', 'v3', developerKey=api_key)
+    return None
+
+def search_youtube_videos(query: str, max_results: int = 5):
+    """Search for related videos on YouTube"""
+    youtube = get_youtube_service()
+    if not youtube:
+        return []
+    
+    try:
+        search_response = youtube.search().list(
+            part='id,snippet',
+            q=query,
+            type='video',
+            maxResults=max_results,
+            order='relevance'
+        ).execute()
+
+        videos = []
+        for item in search_response['items']:
+            videos.append({
+                'video_id': item['id']['videoId'],
+                'title': item['snippet']['title'],
+                'description': item['snippet']['description'],
+                'channel_title': item['snippet']['channelTitle'],
+                'published_at': item['snippet']['publishedAt'],
+                'url': f"https://www.youtube.com/watch?v={item['id']['videoId']}"
+            })
+        return videos
+    except Exception as e:
+        logger.error(f"YouTube search error: {e}")
+        return []
 
 def process_related_video_segments(video_info: dict, query: str, top_k: int = 1):
     """Process segments for a related video - returns exactly one best match"""
@@ -48,10 +83,10 @@ def process_related_video_segments(video_info: dict, query: str, top_k: int = 1)
         
         # Index if not already indexed
         if not youtube_service.is_video_indexed(video_id):
-            youtube_service.index_video_enhanced(video_url, video_id)  # Updated method name
+            youtube_service.index_video(video_url, video_id)
         
         # Search segments - we only want the top 1 result
-        results = youtube_service.search_video_content_enhanced(query, video_id, top_k=1)  # Updated method name
+        results = youtube_service.search_video_content(query, video_id, top_k=1)
         
         # Return only the best match if found
         if results:
@@ -61,7 +96,7 @@ def process_related_video_segments(video_info: dict, query: str, top_k: int = 1)
                 "timestamp": int(r["start"]),
                 "snippet": snippet,
                 "url": r["url"],
-                "score": round(r.get("relevance_score", r.get("score", 0)), 4)  # Updated score field
+                "score": round(r["score"], 4)
             }
         else:
             return None
@@ -76,20 +111,19 @@ async def search_transcript(data: SearchRequest):
         # Extract video ID from URL
         video_id = youtube_service.extract_video_id(data.youtube_url)
         
-        # Get input video metadata (updated method name)
-        metadata = youtube_service.get_video_metadata(video_id)
-        input_video_title = metadata.get('title', f'Video {video_id}')
+        # Get input video title
+        input_video_title = youtube_service.get_video_title(video_id)
         
         # Index video if not already indexed
         if not youtube_service.is_video_indexed(video_id):
             print("⚙️ Indexing new video transcript before search...")
-            success = youtube_service.index_video_enhanced(data.youtube_url, video_id)  # Updated method name
+            success = youtube_service.index_video(data.youtube_url, video_id)
             if not success:
                 raise HTTPException(status_code=500, detail="Failed to index video transcript")
             print("✅ Indexing done. Proceeding to search.")
         
         # Search input video after ensuring indexing is complete
-        results = youtube_service.search_video_content_enhanced(data.query, video_id, top_k=data.top_k)  # Updated method name
+        results = youtube_service.search_video_content(data.query, video_id, top_k=data.top_k)
         
         # Format input video results
         input_video_segments = []
@@ -99,7 +133,7 @@ async def search_transcript(data: SearchRequest):
                 "timestamp": int(r["start"]),
                 "snippet": snippet,
                 "url": r["url"],
-                "score": round(r.get("relevance_score", r.get("score", 0)), 4)  # Updated score field
+                "score": round(r["score"], 4)
             })
         
         # Prepare response
@@ -118,8 +152,8 @@ async def search_transcript(data: SearchRequest):
         if data.suggestions:
             print("🌟 Suggestions enabled - searching for related videos...")
             
-            # Use the YouTube service method for searching videos (updated method name)
-            related_videos = youtube_service.search_youtube_videos_enhanced(data.query, data.max_related_videos)
+            # Use the YouTube service method for searching videos
+            related_videos = youtube_service.search_youtube_videos(data.query, data.max_related_videos)
             
             related_videos_with_segments = []
             for video in related_videos:
@@ -156,52 +190,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    # Add service health check
-    try:
-        health_status = youtube_service.get_health_status()
-        return {
-            "status": "healthy",
-            "service_health": health_status
-        }
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {
-            "status": "unhealthy",
-            "error": str(e)
-        }
-
-# Additional endpoint to get service statistics
-@app.get("/stats")
-async def get_statistics():
-    try:
-        stats = youtube_service.get_indexing_statistics()
-        return {
-            "status": "success",
-            "statistics": stats
-        }
-    except Exception as e:
-        logger.error(f"Statistics error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Additional endpoint to manually reset circuit breaker
-@app.post("/admin/reset-circuit-breaker")
-async def reset_circuit_breaker():
-    try:
-        youtube_service.reset_circuit_breaker()
-        return {"status": "success", "message": "Circuit breaker reset"}
-    except Exception as e:
-        logger.error(f"Reset circuit breaker error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Additional endpoint to cleanup failed videos
-@app.post("/admin/cleanup")
-async def cleanup_failed_videos():
-    try:
-        youtube_service.cleanup_failed_videos()
-        return {"status": "success", "message": "Failed videos cleaned up"}
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     # Get configuration from environment variables with defaults

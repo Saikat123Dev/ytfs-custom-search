@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
 
-from services.youtube_service import YouTubeWorkflowService
+from app.services.youtube_service import YouTubeWorkflowService
 app = FastAPI()
 
 origins = [

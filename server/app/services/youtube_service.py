@@ -135,7 +135,8 @@ class YouTubeWorkflowService:
             # Method 1: Try preferred languages
             for lang in language_preferences:
                 try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang], proxies={"https": "http://localhost:8080"})
+                    cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
+                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang], proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                     transcript_source = f"Language: {lang}"
                     logger.info(f"Successfully retrieved transcript in {lang}")
                     break

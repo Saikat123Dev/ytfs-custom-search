@@ -92,7 +92,13 @@ class YouTubeWorkflowService:
 
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
     cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
-    def get_available_transcripts(self, video_id: str) -> Dict[str, Any]:
+    def get_available_transcripts(
+    self,
+    video_id: str,
+    proxies: Optional[Dict[str, str]] = None,
+    verify: Optional[str] = None
+) -> Dict[str, Any]:
+
         """Get information about available transcripts for debugging"""
         cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
         try:
@@ -164,7 +170,7 @@ class YouTubeWorkflowService:
                     # Get the first available transcript
                     for transcript in transcript_list:
                         try:
-                            raw_transcript = transcript.fetch()
+                            raw_transcript = transcript.fetch(proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                             transcript_source = f"First available: {transcript.language_code}"
                             logger.info(f"Retrieved transcript in {transcript.language_code}")
                             break
@@ -181,7 +187,7 @@ class YouTubeWorkflowService:
                     for transcript in transcript_list:
                         if transcript.is_generated:
                             try:
-                                raw_transcript = transcript.fetch()
+                                raw_transcript = transcript.fetch(proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                                 transcript_source = f"Generated: {transcript.language_code}"
                                 logger.info(f"Retrieved generated transcript in {transcript.language_code}")
                                 break

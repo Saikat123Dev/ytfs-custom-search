@@ -91,11 +91,12 @@ class YouTubeWorkflowService:
                 return match.group(1)
 
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
-
+    cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
     def get_available_transcripts(self, video_id: str) -> Dict[str, Any]:
         """Get information about available transcripts for debugging"""
+        cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
             available = {}
 
             for transcript in transcript_list:
@@ -121,7 +122,8 @@ class YouTubeWorkflowService:
         try:
             # First, try to get transcript list to see what's available
             logger.info(f"Checking available transcripts for video {video_id}...")
-            available_transcripts = self.get_available_transcripts(video_id)
+            cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
+            available_transcripts = self.get_available_transcripts(video_id,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
 
             if available_transcripts:
                 logger.info(f"Available transcripts: {list(available_transcripts.keys())}")
@@ -135,7 +137,7 @@ class YouTubeWorkflowService:
             # Method 1: Try preferred languages
             for lang in language_preferences:
                 try:
-                    cert_path = os.path.join(os.path.dirname(__file__), "zyte-ca.crt")
+                    
                     raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang], proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                     transcript_source = f"Language: {lang}"
                     logger.info(f"Successfully retrieved transcript in {lang}")
@@ -149,7 +151,7 @@ class YouTubeWorkflowService:
             # Method 2: Try without language specification (auto-detect)
             if raw_transcript is None:
                 try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                     transcript_source = "Auto-detected language"
                     logger.info("Successfully retrieved transcript with auto-detection")
                 except Exception as e:
@@ -158,7 +160,7 @@ class YouTubeWorkflowService:
             # Method 3: Try to get any available transcript
             if raw_transcript is None:
                 try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                     # Get the first available transcript
                     for transcript in transcript_list:
                         try:
@@ -175,7 +177,7 @@ class YouTubeWorkflowService:
             # Method 4: Try to get generated transcript if manual not available
             if raw_transcript is None:
                 try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                     for transcript in transcript_list:
                         if transcript.is_generated:
                             try:
@@ -192,7 +194,7 @@ class YouTubeWorkflowService:
             # If we still don't have a transcript, try translated versions
             if raw_transcript is None:
                 try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"},verify=cert_path)
                     for transcript in transcript_list:
                         if transcript.is_translatable:
                             try:

@@ -118,7 +118,8 @@ class YouTubeWorkflowService:
             logger.error(f"Error getting transcript list: {e}")
             return {}
 
-    def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
+    def get_transcript(self, youtube_url: str, proxies: Optional[Dict[str, str]] = None,
+    verify: Optional[str] = None) -> List[TranscriptSegment]:
         """Get transcript segments from YouTube video with improved error handling"""
         video_id = self.extract_video_id(youtube_url)
 

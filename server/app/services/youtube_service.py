@@ -35,7 +35,10 @@ voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
 # LanceDB setup
 embedding_dim = 768
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 db = lancedb.connect(os.path.join(BASE_DIR, "lancedb_data"))
 print('db', db)
 
@@ -110,6 +113,8 @@ class YouTubeWorkflowService:
                 logger.warning(f"Could not load certifi certificates: {e}")
             
             # If custom certificate file exists, use it
+            logger.info("Checking for custom SSL certificate...")
+            logger.info(f"BASE_DIR: {BASE_DIR}")
             cert_file = os.path.join(BASE_DIR, "zyte-ca.crt")
             if os.path.exists(cert_file):
                 try:

@@ -4,6 +4,8 @@ import uuid
 import logging
 import numpy as np
 import pyarrow as pa
+import ssl
+import certifi
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -16,6 +18,9 @@ from googleapiclient.errors import HttpError
 import google.generativeai as genai
 import voyageai
 import lancedb
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Load environment variables
 load_dotenv()
@@ -75,15 +80,86 @@ class YouTubeWorkflowService:
             self.youtube = None
             logger.warning("YouTube API key not found. Suggestions feature will be limited.")
         
-        # Configure proxy settings for transcript API
+        # Configure proxy settings with SSL handling
         self.proxy_config = None
-        if os.getenv("USE_PROXY", "false").lower() == "true":
+        self.use_proxy = os.getenv("USE_PROXY", "false").lower() == "true"
+        
+        if self.use_proxy:
             proxy_url = os.getenv("PROXY_URL", "http://81af49f477b044f6872b853f907fe061:@api.zyte.com:8011")
             self.proxy_config = {
                 "http": proxy_url,
                 "https": proxy_url,
             }
             logger.info("Proxy configuration enabled")
+            
+            # Setup SSL context for proxy
+            self._setup_ssl_context()
+        else:
+            logger.info("Proxy configuration disabled")
+
+    def _setup_ssl_context(self):
+        """Setup SSL context for proxy connections"""
+        try:
+            # Create SSL context
+            ssl_context = ssl.create_default_context()
+            
+            # Try to use certifi certificates first
+            try:
+                ssl_context.load_verify_locations(certifi.where())
+            except Exception as e:
+                logger.warning(f"Could not load certifi certificates: {e}")
+            
+            # If custom certificate file exists, use it
+            cert_file = os.path.join(BASE_DIR, "zyte-ca.crt")
+            if os.path.exists(cert_file):
+                try:
+                    ssl_context.load_verify_locations(cert_file)
+                    logger.info("Loaded custom SSL certificate")
+                except Exception as e:
+                    logger.warning(f"Could not load custom certificate: {e}")
+            
+            # For development/testing, you might want to disable SSL verification
+            # ONLY do this if you're sure about the security implications
+            if os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true":
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                logger.warning("SSL verification disabled - this is not recommended for production")
+            
+            self.ssl_context = ssl_context
+            
+        except Exception as e:
+            logger.error(f"Failed to setup SSL context: {e}")
+            self.ssl_context = None
+
+    def _make_request_with_proxy(self, url: str, **kwargs):
+        """Make HTTP request with proper proxy and SSL configuration"""
+        if not self.use_proxy:
+            return requests.get(url, **kwargs)
+        
+        session = requests.Session()
+        
+        # Configure retries
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Set proxy
+        session.proxies = self.proxy_config
+        
+        # Handle SSL verification
+        if os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true":
+            session.verify = False
+        elif os.path.exists(os.path.join(BASE_DIR, "zyte-ca.crt")):
+            session.verify = os.path.join(BASE_DIR, "zyte-ca.crt")
+        else:
+            session.verify = True
+        
+        return session.get(url, **kwargs)
 
     def extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL"""
@@ -105,10 +181,12 @@ class YouTubeWorkflowService:
     def get_available_transcripts(self, video_id: str) -> Dict[str, Any]:
         """Get information about available transcripts for debugging"""
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(
-                video_id, 
-                proxies=self.proxy_config
-            )
+            # Configure proxy and SSL settings for youtube-transcript-api
+            kwargs = {}
+            if self.proxy_config:
+                kwargs['proxies'] = self.proxy_config
+            
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, **kwargs)
             available = {}
 
             for transcript in transcript_list:
@@ -131,6 +209,11 @@ class YouTubeWorkflowService:
         # Language preference order (add more as needed)
         language_preferences = ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU']
 
+        # Configure request kwargs
+        request_kwargs = {}
+        if self.proxy_config:
+            request_kwargs['proxies'] = self.proxy_config
+
         try:
             # First, try to get transcript list to see what's available
             logger.info(f"Checking available transcripts for video {video_id}...")
@@ -152,7 +235,7 @@ class YouTubeWorkflowService:
                     raw_transcript = YouTubeTranscriptApi.get_transcript(
                         video_id, 
                         languages=[lang], 
-                        proxies=self.proxy_config
+                        **request_kwargs
                     )
                     transcript_source = f"Language: {lang}"
                     logger.info(f"Successfully retrieved transcript in {lang}")
@@ -168,7 +251,7 @@ class YouTubeWorkflowService:
                 try:
                     raw_transcript = YouTubeTranscriptApi.get_transcript(
                         video_id, 
-                        proxies=self.proxy_config
+                        **request_kwargs
                     )
                     transcript_source = "Auto-detected language"
                     logger.info("Successfully retrieved transcript with auto-detection")
@@ -180,12 +263,12 @@ class YouTubeWorkflowService:
                 try:
                     transcript_list = YouTubeTranscriptApi.list_transcripts(
                         video_id, 
-                        proxies=self.proxy_config
+                        **request_kwargs
                     )
                     # Get the first available transcript
                     for transcript in transcript_list:
                         try:
-                            raw_transcript = transcript.fetch(proxies=self.proxy_config)
+                            raw_transcript = transcript.fetch(**request_kwargs)
                             transcript_source = f"First available: {transcript.language_code}"
                             logger.info(f"Retrieved transcript in {transcript.language_code}")
                             break
@@ -200,12 +283,12 @@ class YouTubeWorkflowService:
                 try:
                     transcript_list = YouTubeTranscriptApi.list_transcripts(
                         video_id, 
-                        proxies=self.proxy_config
+                        **request_kwargs
                     )
                     for transcript in transcript_list:
                         if transcript.is_generated:
                             try:
-                                raw_transcript = transcript.fetch(proxies=self.proxy_config)
+                                raw_transcript = transcript.fetch(**request_kwargs)
                                 transcript_source = f"Generated: {transcript.language_code}"
                                 logger.info(f"Retrieved generated transcript in {transcript.language_code}")
                                 break
@@ -220,14 +303,14 @@ class YouTubeWorkflowService:
                 try:
                     transcript_list = YouTubeTranscriptApi.list_transcripts(
                         video_id, 
-                        proxies=self.proxy_config
+                        **request_kwargs
                     )
                     for transcript in transcript_list:
                         if transcript.is_translatable:
                             try:
                                 # Try to translate to English
                                 translated = transcript.translate('en')
-                                raw_transcript = translated.fetch(proxies=self.proxy_config)
+                                raw_transcript = translated.fetch(**request_kwargs)
                                 transcript_source = f"Translated to English from {transcript.language_code}"
                                 logger.info(f"Retrieved translated transcript from {transcript.language_code}")
                                 break
@@ -237,6 +320,17 @@ class YouTubeWorkflowService:
                 except Exception as e:
                     logger.error(f"Failed to get translatable transcripts: {e}")
 
+            # Final fallback: try without proxy if proxy was used
+            if raw_transcript is None and self.proxy_config:
+                logger.info("Attempting to retrieve transcript without proxy as final fallback...")
+                try:
+                    # Try without proxy
+                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                    transcript_source = "Fallback without proxy"
+                    logger.info("Successfully retrieved transcript without proxy")
+                except Exception as e:
+                    logger.warning(f"Fallback without proxy failed: {e}")
+
             if raw_transcript is None:
                 # Provide detailed error information
                 error_msg = f"Could not retrieve transcript for video {video_id}. "
@@ -244,7 +338,7 @@ class YouTubeWorkflowService:
                     error_msg += f"Available languages: {list(available_transcripts.keys())}. "
                 else:
                     error_msg += "No transcripts appear to be available. "
-                error_msg += "This could be due to: 1) Transcripts disabled by uploader, 2) Video is too new, 3) Video is private/restricted, 4) Regional restrictions."
+                error_msg += "This could be due to: 1) Transcripts disabled by uploader, 2) Video is too new, 3) Video is private/restricted, 4) Regional restrictions, 5) SSL/Proxy configuration issues."
                 raise ValueError(error_msg)
 
             logger.info(f"Transcript retrieved via: {transcript_source}")
@@ -590,3 +684,4 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
         print(f"   📅 Published: {video['published_at'][:10]}")
         print(f"   📝 {desc_preview}")
         print(f"   🔗 {video['url']}")
+        

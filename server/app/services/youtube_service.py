@@ -149,12 +149,12 @@ class YouTubeWorkflowService:
             r"watch\?v=([0-9A-Za-z_-]{11})",
             r"shorts\/([0-9A-Za-z_-]{11})"
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, url)
             if match:
                 return match.group(1)
-        
+
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
 
     def _try_with_proxies(self, func, *args, **kwargs):
@@ -494,11 +494,11 @@ class YouTubeWorkflowService:
         """Chunk transcript into manageable pieces for embedding"""
         if not segments:
             return []
-        
+
         # Create indexed text for chunking
         full_text = "\n".join(f"{i}|{seg.start}|{seg.duration}|{seg.text}" 
                              for i, seg in enumerate(segments))
-        
+
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
         raw_chunks = splitter.split_text(full_text)
 
@@ -506,7 +506,7 @@ class YouTubeWorkflowService:
         for chunk in raw_chunks:
             parts = chunk.split("\n")
             indices = []
-            
+
             for part in parts:
                 if "|" in part:
                     try:
@@ -514,22 +514,22 @@ class YouTubeWorkflowService:
                         indices.append(idx)
                     except (ValueError, IndexError):
                         continue
-            
+
             if not indices:
                 continue
-            
+
             # Get the first segment for metadata
             first_segment = segments[min(indices)]
-            
+
             # Extract clean text content
             clean_text = "\n".join(part.split("|", 3)[-1] for part in parts if "|" in part and len(part.split("|")) >= 4)
-            
+
             if not clean_text.strip():
                 continue
-            
+
             # Calculate total duration for this chunk
             total_duration = sum(segments[i].duration for i in indices if i < len(segments))
-            
+
             documents.append(Document(
                 page_content=clean_text,
                 metadata={
@@ -537,7 +537,7 @@ class YouTubeWorkflowService:
                     "duration": total_duration
                 }
             ))
-        
+
         return documents
 
     def embed_text(self, text: str, task_type: str = "retrieval_document") -> List[float]:
@@ -546,18 +546,18 @@ class YouTubeWorkflowService:
             if not text.strip():
                 logger.warning("Empty text provided for embedding")
                 return [0.0] * embedding_dim
-            
+
             result = genai.embed_content(
                 model="models/embedding-001",
                 content=text,
                 task_type=task_type
             )
             embedding = result["embedding"]
-            
+
             # Ensure correct dimension
             if len(embedding) != embedding_dim:
                 raise ValueError(f"Embedding dimension mismatch: expected {embedding_dim}, got {len(embedding)}")
-            
+
             return embedding
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
@@ -568,11 +568,11 @@ class YouTubeWorkflowService:
         """Generate embeddings for multiple texts using threading"""
         if not texts:
             return []
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self.embed_text, text): i for i, text in enumerate(texts)}
             embeddings = [None] * len(texts)
-            
+
             for future in as_completed(futures):
                 index = futures[future]
                 try:
@@ -581,7 +581,7 @@ class YouTubeWorkflowService:
                     logger.error(f"Failed to embed text at index {index}: {e}")
                     # Use zero vector as fallback
                     embeddings[index] = [0.0] * embedding_dim
-            
+
             return embeddings
 
     def is_video_indexed(self, video_id: str) -> bool:
@@ -601,15 +601,16 @@ class YouTubeWorkflowService:
 
         try:
             logger.info(f"Getting transcript for video {video_id}...")
-            segments = self.get_transcript(youtube_url)
             
+            segments = self.get_transcript(youtube_url,proxies={"https": "http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/","http":"http://fa337bcb829740e297a5875dec49f235:@api.zyte.com:8011/"})
+
             if not segments:
                 logger.warning(f"No transcript segments found for video {video_id}")
                 return False
-            
+
             logger.info(f"Chunking transcript into documents...")
             chunks = self.chunk_transcript(segments)
-            
+
             if not chunks:
                 logger.warning(f"No chunks created for video {video_id}")
                 return False
@@ -649,11 +650,11 @@ class YouTubeWorkflowService:
         try:
             # Generate query embedding
             query_embedding = self.embed_text(query, task_type="retrieval_query")
-            
+
             if not query_embedding or all(x == 0.0 for x in query_embedding):
                 logger.error("Failed to generate valid query embedding")
                 return []
-            
+
             # Search in vector database
             results = (
                 table.search(query_embedding, vector_column_name="vector")
@@ -661,7 +662,7 @@ class YouTubeWorkflowService:
                 .limit(top_k * 2)  # Get more results for reranking
                 .to_list()
             )
-            
+
             if not results:
                 return []
 
@@ -674,7 +675,7 @@ class YouTubeWorkflowService:
                     model="rerank-2", 
                     top_k=top_k
                 )
-                
+
                 final_results = []
                 for res in reranked.results:
                     doc = results[res.index]
@@ -685,9 +686,9 @@ class YouTubeWorkflowService:
                         "score": res.relevance_score,
                         "url": f"https://www.youtube.com/watch?v={video_id}&t={int(doc['start'])}s"
                     })
-                
+
                 return final_results
-                
+
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
                 # Fallback to original results without reranking
@@ -770,7 +771,7 @@ def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
 
     if video_title:
         print(f"\n🎥 Video: {video_title}")
-    
+
     print(f"🎯 Found {len(segments)} relevant segments:")
     print("-" * 60)
 

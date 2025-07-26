@@ -4,10 +4,14 @@ import uuid
 import logging
 import numpy as np
 import pyarrow as pa
+import json
+import subprocess
+import tempfile
+import urllib.request
+import urllib.error
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+import yt_dlp
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,8 +35,8 @@ voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 # LanceDB setup
 embedding_dim = 768
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-db = lancedb.connect(os.path.join(BASE_DIR, "lancedb_data"))
-print('db',db)
+db_path = os.path.join(BASE_DIR, "lancedb_data")
+db = lancedb.connect(db_path)
 
 schema = pa.schema([
     ("id", pa.string()),
@@ -43,20 +47,16 @@ schema = pa.schema([
     ("vector", pa.list_(pa.float32(), embedding_dim))
 ])
 
+# Ensure clean state before creating table
 try:
-    table = db.open_table("transcripts")
-    logger.info("Successfully opened existing 'transcripts' table.")
-except ValueError:
-    logger.info("Table 'transcripts' not found. Creating new table.")
-    try:
-        # Try to drop table if it exists (but ignore if it doesn't)
-        db.drop_table("transcripts", ignore_missing=True)
-    except Exception as e:
-        logger.debug(f"Error dropping table (this is expected if table doesn't exist): {e}")
-    
-    # Create new table
-    table = db.create_table("transcripts", schema=schema)
-    logger.info("Successfully created 'transcripts' table.")
+    db.drop_table("transcripts", ignore_missing=True)
+    logger.info("Dropped old transcripts table.")
+except Exception as e:
+    logger.warning(f"Drop failed or not needed: {e}")
+
+# Create new table
+table = db.create_table("transcripts", schema=schema)
+logger.info("Created new transcripts table.")
 
 
 class TranscriptSegment:
@@ -74,6 +74,71 @@ class YouTubeWorkflowService:
         else:
             self.youtube = None
             logger.warning("YouTube API key not found. Suggestions feature will be limited.")
+        
+        # Proxy configuration - set these in your .env file
+        self.proxy_servers = self._load_proxy_config()
+        
+    def _load_proxy_config(self) -> List[str]:
+        """Load proxy configuration from environment variables"""
+        proxies = []
+        
+        # Single proxy from env
+        single_proxy = os.getenv("YOUTUBE_PROXY")
+        if single_proxy:
+            proxies.append(single_proxy)
+        
+        # Multiple proxies from env (comma-separated)
+        proxy_list = os.getenv("YOUTUBE_PROXY_LIST")
+        if proxy_list:
+            proxies.extend([p.strip() for p in proxy_list.split(",") if p.strip()])
+        
+        # Default proxy servers (you can customize these)
+        default_proxies = [
+            # HTTP proxies
+            "http://proxy1.example.com:8080",
+            "http://proxy2.example.com:8080",
+            # SOCKS proxies
+            "socks5://proxy3.example.com:1080",
+            "socks4://proxy4.example.com:1080",
+        ]
+        
+        # Only use default proxies if no custom ones are provided
+        if not proxies:
+            logger.info("No custom proxies configured, using default proxy list")
+            # Uncomment the line below if you want to use default proxies
+            # proxies = default_proxies
+        
+        logger.info(f"Loaded {len(proxies)} proxy servers")
+        return proxies
+    
+    def _get_ytdlp_options(self, proxy: Optional[str] = None) -> Dict[str, Any]:
+        """Get yt-dlp options with proxy support"""
+        options = {
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU'],
+            'subtitlesformat': 'json3',
+            'skip_download': True,
+            'ignoreerrors': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'quiet': True,
+            'cookiefile': os.getenv("YOUTUBE_COOKIES_FILE"),  # Optional: cookies file path
+        }
+        
+        # Add proxy if provided
+        if proxy:
+            options['proxy'] = proxy
+            logger.info(f"Using proxy: {proxy}")
+        
+        # Add authentication if available
+        username = os.getenv("YOUTUBE_USERNAME")
+        password = os.getenv("YOUTUBE_PASSWORD")
+        if username and password:
+            options['username'] = username
+            options['password'] = password
+        
+        return options
 
     def extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL"""
@@ -92,159 +157,338 @@ class YouTubeWorkflowService:
         
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
 
-    def get_available_transcripts(self, video_id: str) -> Dict[str, Any]:
-        """Get information about available transcripts for debugging"""
+    def _try_with_proxies(self, func, *args, **kwargs):
+        """Try a function with different proxies until one works"""
+        # First try without proxy
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            available = {}
-            
-            for transcript in transcript_list:
-                available[transcript.language] = {
-                    'language': transcript.language,
-                    'language_code': transcript.language_code,
-                    'is_generated': transcript.is_generated,
-                    'is_translatable': transcript.is_translatable
-                }
-            
-            return available
+            return func(None, *args, **kwargs)
         except Exception as e:
-            logger.error(f"Error getting transcript list: {e}")
-            return {}
+            logger.warning(f"Direct connection failed: {e}")
+        
+        # Try with each proxy
+        for proxy in self.proxy_servers:
+            try:
+                logger.info(f"Trying with proxy: {proxy}")
+                return func(proxy, *args, **kwargs)
+            except Exception as e:
+                logger.warning(f"Proxy {proxy} failed: {e}")
+                continue
+        
+        raise Exception("All proxy attempts failed")
+
+    def _extract_info_with_proxy(self, proxy: Optional[str], url: str) -> Dict[str, Any]:
+        """Extract video info using yt-dlp with proxy support"""
+        options = self._get_ytdlp_options(proxy)
+        
+        with yt_dlp.YoutubeDL(options) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+                return info
+            except Exception as e:
+                logger.error(f"yt-dlp extraction failed: {e}")
+                raise
+
+    def _download_subtitle_content(self, url: str, video_id: str) -> Dict[str, Any]:
+        """Download subtitle content from URL"""
+        import urllib.request
+        import urllib.error
+        import json
+        
+        try:
+            # Try direct download first
+            with urllib.request.urlopen(url) as response:
+                content = response.read().decode('utf-8')
+                return json.loads(content)
+        except Exception as e:
+            logger.warning(f"Direct download failed: {e}")
+            
+            # Try with proxy if available
+            for proxy in self.proxy_servers:
+                try:
+                    # Setup proxy handler
+                    if proxy.startswith('http://') or proxy.startswith('https://'):
+                        proxy_handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy})
+                    elif proxy.startswith('socks'):
+                        # For SOCKS proxies, you might need additional setup
+                        logger.warning(f"SOCKS proxy {proxy} not supported for direct download")
+                        continue
+                    else:
+                        continue
+                    
+                    opener = urllib.request.build_opener(proxy_handler)
+                    with opener.open(url) as response:
+                        content = response.read().decode('utf-8')
+                        return json.loads(content)
+                        
+                except Exception as proxy_error:
+                    logger.warning(f"Proxy {proxy} failed: {proxy_error}")
+                    continue
+            
+            raise Exception(f"All download attempts failed for subtitle URL")
+
+    def _parse_ytdlp_subtitles(self, info: Dict[str, Any]) -> List[TranscriptSegment]:
+        """Parse subtitles from yt-dlp info"""
+        segments = []
+        
+        # Try to get subtitles in order of preference
+        subtitle_keys = ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU']
+        
+        subtitles = info.get('subtitles', {})
+        automatic_captions = info.get('automatic_captions', {})
+        
+        # Combine both subtitle sources (manual subtitles take precedence)
+        all_subtitles = {**automatic_captions, **subtitles}
+        
+        selected_subtitles = None
+        selected_lang = None
+        
+        # Find the best available subtitle language
+        for lang in subtitle_keys:
+            if lang in all_subtitles:
+                selected_subtitles = all_subtitles[lang]
+                selected_lang = lang
+                break
+        
+        if not selected_subtitles:
+            # Try any available language
+            for lang, subs in all_subtitles.items():
+                if subs:
+                    selected_subtitles = subs
+                    selected_lang = lang
+                    break
+        
+        if not selected_subtitles:
+            raise ValueError("No subtitles available for this video")
+        
+        logger.info(f"Using subtitles in language: {selected_lang}")
+        
+        # Find the best subtitle format
+        subtitle_info = None
+        format_priority = ['json3', 'vtt', 'srv3', 'srv2', 'srv1', 'ttml']
+        
+        for fmt in format_priority:
+            for sub_info in selected_subtitles:
+                if sub_info.get('ext') == fmt:
+                    subtitle_info = sub_info
+                    break
+            if subtitle_info:
+                break
+        
+        if not subtitle_info:
+            # Fallback to first available format
+            subtitle_info = selected_subtitles[0] if selected_subtitles else None
+        
+        if not subtitle_info:
+            raise ValueError("No suitable subtitle format found")
+        
+        subtitle_url = subtitle_info.get('url')
+        if not subtitle_url:
+            raise ValueError("No subtitle URL found")
+        
+        logger.info(f"Downloading subtitles in format: {subtitle_info.get('ext', 'unknown')}")
+        
+        try:
+            # Download and parse subtitle content
+            subtitle_data = self._download_subtitle_content(subtitle_url, info['id'])
+            
+            # Parse based on format
+            subtitle_format = subtitle_info.get('ext', 'unknown')
+            
+            if subtitle_format == 'json3' and 'events' in subtitle_data:
+                # JSON3 format (YouTube's detailed format)
+                for event in subtitle_data['events']:
+                    if 'segs' in event:
+                        start_time = float(event.get('tStartMs', 0)) / 1000.0
+                        duration = float(event.get('dDurationMs', 0)) / 1000.0
+                        
+                        text_parts = []
+                        for seg in event['segs']:
+                            if 'utf8' in seg:
+                                text_parts.append(seg['utf8'])
+                        
+                        text = ''.join(text_parts).strip()
+                        if text and text != '\n':
+                            # Clean up text
+                            text = re.sub(r'\n+', ' ', text)
+                            text = re.sub(r'\s+', ' ', text)
+                            segments.append(TranscriptSegment(
+                                text=text,
+                                start=start_time,
+                                duration=max(duration, 1.0)  # Ensure minimum duration
+                            ))
+            
+            elif isinstance(subtitle_data, list):
+                # Standard list format
+                for item in subtitle_data:
+                    text = item.get('text', '').strip()
+                    start = float(item.get('start', 0))
+                    duration = float(item.get('dur', item.get('duration', 1.0)))
+                    
+                    if text and text != '\n':
+                        # Clean up text
+                        text = re.sub(r'\n+', ' ', text)
+                        text = re.sub(r'\s+', ' ', text)
+                        segments.append(TranscriptSegment(
+                            text=text,
+                            start=start,
+                            duration=max(duration, 1.0)
+                        ))
+            
+            else:
+                # Try to parse as VTT or other text-based formats
+                if isinstance(subtitle_data, str):
+                    # Parse VTT or SRT format
+                    segments = self._parse_text_subtitles(subtitle_data)
+                else:
+                    raise ValueError(f"Unknown subtitle format: {subtitle_format}")
+            
+        except Exception as e:
+            logger.error(f"Error parsing subtitle data: {e}")
+            raise ValueError(f"Failed to parse subtitle data: {e}")
+        
+        if not segments:
+            raise ValueError("No valid transcript segments found after parsing")
+        
+        # Sort segments by start time
+        segments.sort(key=lambda x: x.start)
+        
+        logger.info(f"Successfully parsed {len(segments)} subtitle segments")
+        return segments
+    
+    def _parse_text_subtitles(self, content: str) -> List[TranscriptSegment]:
+        """Parse VTT or SRT format subtitles"""
+        segments = []
+        lines = content.split('\n')
+        
+        current_start = None
+        current_duration = None
+        current_text = []
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Skip empty lines and headers
+            if not line or line.startswith('WEBVTT') or line.startswith('NOTE'):
+                continue
+            
+            # Time code pattern (VTT: 00:00:01.000 --> 00:00:03.000)
+            time_match = re.match(r'(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})', line)
+            if time_match:
+                # Save previous segment
+                if current_start is not None and current_text:
+                    text = ' '.join(current_text).strip()
+                    if text:
+                        segments.append(TranscriptSegment(
+                            text=text,
+                            start=current_start,
+                            duration=current_duration or 1.0
+                        ))
+                
+                # Parse new timestamp
+                h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, time_match.groups())
+                start_time = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0
+                end_time = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0
+                
+                current_start = start_time
+                current_duration = end_time - start_time
+                current_text = []
+                continue
+            
+            # SRT time code pattern (00:00:01,000 --> 00:00:03,000)
+            srt_time_match = re.match(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})', line)
+            if srt_time_match:
+                # Save previous segment
+                if current_start is not None and current_text:
+                    text = ' '.join(current_text).strip()
+                    if text:
+                        segments.append(TranscriptSegment(
+                            text=text,
+                            start=current_start,
+                            duration=current_duration or 1.0
+                        ))
+                
+                # Parse new timestamp
+                h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, srt_time_match.groups())
+                start_time = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0
+                end_time = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0
+                
+                current_start = start_time
+                current_duration = end_time - start_time
+                current_text = []
+                continue
+            
+            # Skip numeric lines (SRT sequence numbers)
+            if line.isdigit():
+                continue
+            
+            # Collect text content
+            if current_start is not None:
+                # Clean up text
+                clean_line = re.sub(r'<[^>]+>', '', line)  # Remove HTML tags
+                clean_line = re.sub(r'\{[^}]+\}', '', clean_line)  # Remove style tags
+                clean_line = clean_line.strip()
+                if clean_line:
+                    current_text.append(clean_line)
+        
+        # Don't forget the last segment
+        if current_start is not None and current_text:
+            text = ' '.join(current_text).strip()
+            if text:
+                segments.append(TranscriptSegment(
+                    text=text,
+                    start=current_start,
+                    duration=current_duration or 1.0
+                ))
+        
+        return segments
 
     def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
-        """Get transcript segments from YouTube video with improved error handling"""
+        """Get transcript segments from YouTube video using yt-dlp with proxy support"""
         video_id = self.extract_video_id(youtube_url)
-        
-        # Language preference order (add more as needed)
-        language_preferences = ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU']
+        logger.info(f"Extracting transcript for video {video_id}...")
         
         try:
-            # First, try to get transcript list to see what's available
-            logger.info(f"Checking available transcripts for video {video_id}...")
-            available_transcripts = self.get_available_transcripts(video_id)
+            # Try to extract info with proxy fallback
+            info = self._try_with_proxies(self._extract_info_with_proxy, youtube_url)
             
-            if available_transcripts:
-                logger.info(f"Available transcripts: {list(available_transcripts.keys())}")
-            else:
-                logger.warning(f"No transcript information available for video {video_id}")
+            if not info:
+                raise ValueError("Failed to extract video information")
             
-            # Try different approaches to get transcript
-            raw_transcript = None
-            transcript_source = None
+            logger.info(f"Successfully extracted video info: {info.get('title', 'Unknown Title')}")
             
-            # Method 1: Try preferred languages
-            for lang in language_preferences:
-                try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
-                    transcript_source = f"Language: {lang}"
-                    logger.info(f"Successfully retrieved transcript in {lang}")
-                    break
-                except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
-                    continue
-                except Exception as e:
-                    logger.warning(f"Error with language {lang}: {e}")
-                    continue
-            
-            # Method 2: Try without language specification (auto-detect)
-            if raw_transcript is None:
-                try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                    transcript_source = "Auto-detected language"
-                    logger.info("Successfully retrieved transcript with auto-detection")
-                except Exception as e:
-                    logger.warning(f"Auto-detection failed: {e}")
-            
-            # Method 3: Try to get any available transcript
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                    # Get the first available transcript
-                    for transcript in transcript_list:
-                        try:
-                            raw_transcript = transcript.fetch()
-                            transcript_source = f"First available: {transcript.language_code}"
-                            logger.info(f"Retrieved transcript in {transcript.language_code}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch {transcript.language_code}: {e}")
-                            continue
-                except Exception as e:
-                    logger.error(f"Failed to list transcripts: {e}")
-            
-            # Method 4: Try to get generated transcript if manual not available
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                    for transcript in transcript_list:
-                        if transcript.is_generated:
-                            try:
-                                raw_transcript = transcript.fetch()
-                                transcript_source = f"Generated: {transcript.language_code}"
-                                logger.info(f"Retrieved generated transcript in {transcript.language_code}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch generated transcript {transcript.language_code}: {e}")
-                                continue
-                except Exception as e:
-                    logger.error(f"Failed to get generated transcripts: {e}")
-            
-            # If we still don't have a transcript, try translated versions
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                    for transcript in transcript_list:
-                        if transcript.is_translatable:
-                            try:
-                                # Try to translate to English
-                                translated = transcript.translate('en')
-                                raw_transcript = translated.fetch()
-                                transcript_source = f"Translated to English from {transcript.language_code}"
-                                logger.info(f"Retrieved translated transcript from {transcript.language_code}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to translate from {transcript.language_code}: {e}")
-                                continue
-                except Exception as e:
-                    logger.error(f"Failed to get translatable transcripts: {e}")
-            
-            if raw_transcript is None:
-                # Provide detailed error information
-                error_msg = f"Could not retrieve transcript for video {video_id}. "
-                if available_transcripts:
-                    error_msg += f"Available languages: {list(available_transcripts.keys())}. "
-                else:
-                    error_msg += "No transcripts appear to be available. "
-                error_msg += "This could be due to: 1) Transcripts disabled by uploader, 2) Video is too new, 3) Video is private/restricted, 4) Regional restrictions."
-                raise ValueError(error_msg)
-            
-            logger.info(f"Transcript retrieved via: {transcript_source}")
-            logger.info(f"Transcript contains {len(raw_transcript)} segments")
-            
-            # Convert to TranscriptSegment objects
-            segments = []
-            for segment in raw_transcript:
-                # Handle potential missing keys
-                text = segment.get('text', '').strip()
-                start = float(segment.get('start', 0))
-                duration = float(segment.get('duration', 0))
-                
-                if text:  # Only add segments with actual text
-                    segments.append(TranscriptSegment(text=text, start=start, duration=duration))
+            # Parse subtitles
+            segments = self._parse_ytdlp_subtitles(info)
             
             if not segments:
-                raise ValueError(f"Transcript retrieved but contains no valid text segments for video {video_id}")
+                raise ValueError("No transcript segments found")
             
-            logger.info(f"Successfully processed {len(segments)} transcript segments")
+            logger.info(f"Successfully extracted {len(segments)} transcript segments")
             return segments
             
-        except (VideoUnavailable, TranscriptsDisabled, NoTranscriptFound) as e:
-            error_msg = f"Transcript unavailable for video {video_id}: {str(e)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
         except Exception as e:
-            error_msg = f"Unexpected error getting transcript for video {video_id}: {str(e)}"
+            error_msg = f"Failed to get transcript for video {video_id}: {str(e)}"
             logger.error(error_msg)
             raise ValueError(error_msg)
+
+    def get_video_info(self, youtube_url: str) -> Dict[str, Any]:
+        """Get video metadata using yt-dlp"""
+        try:
+            info = self._try_with_proxies(self._extract_info_with_proxy, youtube_url)
+            
+            return {
+                'video_id': info.get('id'),
+                'title': info.get('title'),
+                'description': info.get('description'),
+                'uploader': info.get('uploader'),
+                'upload_date': info.get('upload_date'),
+                'duration': info.get('duration'),
+                'view_count': info.get('view_count'),
+                'like_count': info.get('like_count'),
+                'webpage_url': info.get('webpage_url')
+            }
+        except Exception as e:
+            logger.error(f"Error getting video info: {e}")
+            return {}
 
     def chunk_transcript(self, segments: List[TranscriptSegment]) -> List[Document]:
         """Chunk transcript into manageable pieces for embedding"""
@@ -495,21 +739,24 @@ class YouTubeWorkflowService:
             return []
 
     def get_video_title(self, video_id: str) -> str:
-        """Get video title from YouTube API"""
-        if not self.youtube:
-            return f"Video {video_id}"
+        """Get video title from YouTube API or yt-dlp"""
+        if self.youtube:
+            try:
+                response = self.youtube.videos().list(
+                    part='snippet',
+                    id=video_id
+                ).execute()
 
+                if response['items']:
+                    return response['items'][0]['snippet']['title']
+            except Exception as e:
+                logger.warning(f"YouTube API failed, trying yt-dlp: {e}")
+        
+        # Fallback to yt-dlp
         try:
-            response = self.youtube.videos().list(
-                part='snippet',
-                id=video_id
-            ).execute()
-
-            if response['items']:
-                return response['items'][0]['snippet']['title']
-            else:
-                return f"Video {video_id}"
-
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            info = self._try_with_proxies(self._extract_info_with_proxy, url)
+            return info.get('title', f"Video {video_id}")
         except Exception as e:
             logger.error(f"Error getting video title: {e}")
             return f"Video {video_id}"
@@ -561,3 +808,31 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
         print(f"   🔗 {video['url']}")
 
 
+# Example usage and testing
+if __name__ == "__main__":
+    # Initialize the service
+    service = YouTubeWorkflowService()
+    
+    # Example usage
+    try:
+        # Test video URL
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Replace with actual URL
+        video_id = service.extract_video_id(url)
+        
+        # Get video info
+        info = service.get_video_info(url)
+        print(f"Video Info: {info}")
+        
+        # Index the video
+        success = service.index_video(url, video_id)
+        if success:
+            print(f"Successfully indexed video {video_id}")
+            
+            # Search within the video
+            results = service.search_video_content("your search query", video_id, top_k=3)
+            print_video_segments(results, info.get('title', ''))
+        else:
+            print(f"Failed to index video {video_id}")
+            
+    except Exception as e:
+        print(f"Error: {e}")

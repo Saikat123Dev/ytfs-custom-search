@@ -4,12 +4,14 @@ import uuid
 import logging
 import numpy as np
 import pyarrow as pa
-import ssl
-import certifi
+import json
+import subprocess
+import tempfile
+import urllib.request
+import urllib.error
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+from supadata import Supadata
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,9 +20,6 @@ from googleapiclient.errors import HttpError
 import google.generativeai as genai
 import voyageai
 import lancedb
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # Load environment variables
 load_dotenv()
@@ -33,14 +32,15 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
+# Initialize Supadata
+supadata = Supadata(api_key=os.getenv("SUPADATA_API_KEY"))
+
 # LanceDB setup
 embedding_dim = 768
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-db = lancedb.connect(os.path.join(BASE_DIR, "lancedb_data"))
-print('db', db)
+db_path = os.path.join(BASE_DIR, "lancedb_data")
+db = lancedb.connect(db_path)
 
 schema = pa.schema([
     ("id", pa.string()),
@@ -51,20 +51,16 @@ schema = pa.schema([
     ("vector", pa.list_(pa.float32(), embedding_dim))
 ])
 
+# Ensure clean state before creating table
 try:
-    table = db.open_table("transcripts")
-    logger.info("Successfully opened existing 'transcripts' table.")
-except ValueError:
-    logger.info("Table 'transcripts' not found. Creating new table.")
-    try:
-        # Try to drop table if it exists (but ignore if it doesn't)
-        db.drop_table("transcripts", ignore_missing=True)
-    except Exception as e:
-        logger.debug(f"Error dropping table (this is expected if table doesn't exist): {e}")
+    db.drop_table("transcripts", ignore_missing=True)
+    logger.info("Dropped old transcripts table.")
+except Exception as e:
+    logger.warning(f"Drop failed or not needed: {e}")
 
-    # Create new table
-    table = db.create_table("transcripts", schema=schema)
-    logger.info("Successfully created 'transcripts' table.")
+# Create new table
+table = db.create_table("transcripts", schema=schema)
+logger.info("Created new transcripts table.")
 
 
 class TranscriptSegment:
@@ -83,88 +79,13 @@ class YouTubeWorkflowService:
             self.youtube = None
             logger.warning("YouTube API key not found. Suggestions feature will be limited.")
         
-        # Configure proxy settings with SSL handling
-        self.proxy_config = None
-        self.use_proxy = os.getenv("USE_PROXY", "false").lower() == "true"
+        # Initialize Supadata client
+        supadata_api_key = os.getenv("SUPADATA_API_KEY")
+        if not supadata_api_key:
+            raise ValueError("SUPADATA_API_KEY environment variable is required")
         
-        if self.use_proxy:
-            proxy_url = os.getenv("PROXY_URL", "http://81af49f477b044f6872b853f907fe061:@api.zyte.com:8011")
-            self.proxy_config = {
-                "http": proxy_url,
-                "https": proxy_url,
-            }
-            logger.info("Proxy configuration enabled")
-            
-            # Setup SSL context for proxy
-            self._setup_ssl_context()
-        else:
-            logger.info("Proxy configuration disabled")
-
-    def _setup_ssl_context(self):
-        """Setup SSL context for proxy connections"""
-        try:
-            # Create SSL context
-            ssl_context = ssl.create_default_context()
-            
-            # Try to use certifi certificates first
-            try:
-                ssl_context.load_verify_locations(certifi.where())
-            except Exception as e:
-                logger.warning(f"Could not load certifi certificates: {e}")
-            
-            # If custom certificate file exists, use it
-            logger.info("Checking for custom SSL certificate...")
-            logger.info(f"BASE_DIR: {BASE_DIR}")
-            cert_file = os.path.join(BASE_DIR, "zyte-ca.crt")
-            if os.path.exists(cert_file):
-                try:
-                    ssl_context.load_verify_locations(cert_file)
-                    logger.info("Loaded custom SSL certificate")
-                except Exception as e:
-                    logger.warning(f"Could not load custom certificate: {e}")
-            
-            # For development/testing, you might want to disable SSL verification
-            # ONLY do this if you're sure about the security implications
-            if os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true":
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                logger.warning("SSL verification disabled - this is not recommended for production")
-            
-            self.ssl_context = ssl_context
-            
-        except Exception as e:
-            logger.error(f"Failed to setup SSL context: {e}")
-            self.ssl_context = None
-
-    def _make_request_with_proxy(self, url: str, **kwargs):
-        """Make HTTP request with proper proxy and SSL configuration"""
-        if not self.use_proxy:
-            return requests.get(url, **kwargs)
-        
-        session = requests.Session()
-        
-        # Configure retries
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
-        # Set proxy
-        session.proxies = self.proxy_config
-        
-        # Handle SSL verification
-        if os.getenv("DISABLE_SSL_VERIFY", "false").lower() == "true":
-            session.verify = False
-        elif os.path.exists(os.path.join(BASE_DIR, "zyte-ca.crt")):
-            session.verify = os.path.join(BASE_DIR, "zyte-ca.crt")
-        else:
-            session.verify = True
-        
-        return session.get(url, **kwargs)
+        self.supadata = Supadata(api_key=supadata_api_key)
+        logger.info("Supadata client initialized successfully")
 
     def extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL"""
@@ -182,198 +103,185 @@ class YouTubeWorkflowService:
                 return match.group(1)
 
         raise ValueError("Invalid YouTube URL. Please provide a valid YouTube video URL.")
-   
-    def get_available_transcripts(self, video_id: str) -> Dict[str, Any]:
-        """Get information about available transcripts for debugging"""
+
+    def _parse_supadata_transcript(self, content: List[Any]) -> List[TranscriptSegment]:
+     segments = []
+
+     for item in content:
         try:
-            # Configure proxy and SSL settings for youtube-transcript-api
-            kwargs = {}
-            if self.proxy_config:
-                kwargs['proxies'] = self.proxy_config
-            
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, **kwargs)
-            available = {}
+            # Accessing attributes via dot notation because it's a TranscriptChunk object
+            text = item.text
+            start = float(item.offset) / 1000
+            duration = float(item.duration) / 1000
 
-            for transcript in transcript_list:
-                available[transcript.language] = {
-                    'language': transcript.language,
-                    'language_code': transcript.language_code,
-                    'is_generated': transcript.is_generated,
-                    'is_translatable': transcript.is_translatable
-                }
+            segments.append(TranscriptSegment(
+                text=text,
+                start=start,
+                duration=duration,
+            ))
 
-            return available
         except Exception as e:
-            logger.error(f"Error getting transcript list: {e}")
-            return {}
+            logger.warning(f"Skipping invalid segment: {e}")
+
+     if not segments:
+        raise ValueError("No valid transcript segments found after parsing")
+
+     return segments
+
+
+    
+    def _create_segments_from_text(self, text: str) -> List[TranscriptSegment]:
+        """Create segments from plain text by splitting into sentences"""
+        segments = []
+        
+        # Clean up the text
+        text = re.sub(r'\n+', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        if not text:
+            return segments
+        
+        # Split into sentences (simple approach)
+        sentences = re.split(r'[.!?]+', text)
+        
+        current_time = 0.0
+        segment_duration = 3.0  # Default 3 seconds per segment
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence and len(sentence) > 10:  # Only include substantial sentences
+                segments.append(TranscriptSegment(
+                    text=sentence,
+                    start=current_time,
+                    duration=segment_duration
+                ))
+                current_time += segment_duration
+        
+        # If no sentences found, create one segment with the full text
+        if not segments and text:
+            segments.append(TranscriptSegment(
+                text=text,
+                start=0.0,
+                duration=60.0  # Default 1 minute
+            ))
+        
+        return segments
 
     def get_transcript(self, youtube_url: str) -> List[TranscriptSegment]:
-        """Get transcript segments from YouTube video with improved error handling"""
         video_id = self.extract_video_id(youtube_url)
-
-        # Language preference order (add more as needed)
-        language_preferences = ['en', 'en-US', 'en-GB', 'en-CA', 'en-AU']
-
-        # Configure request kwargs
-        request_kwargs = {}
-        if self.proxy_config:
-            request_kwargs['proxies'] = self.proxy_config
+        logger.info(f"Extracting transcript for video {video_id} using Supadata AI...")
 
         try:
-            # First, try to get transcript list to see what's available
-            logger.info(f"Checking available transcripts for video {video_id}...")
-            
-            available_transcripts = self.get_available_transcripts(video_id)
+            # <-- use video_id, not url
+            transcript = self.supadata.youtube.transcript(
+                video_id=video_id,
+                text=False
+            )
+            print('transcript',type(transcript))
 
-            if available_transcripts:
-                logger.info(f"Available transcripts: {list(available_transcripts.keys())}")
-            else:
-                logger.warning(f"No transcript information available for video {video_id}")
+            if not transcript or not hasattr(transcript, 'content'):
+                raise ValueError("No transcript content returned from Supadata")
 
-            # Try different approaches to get transcript
-            raw_transcript = None
-            transcript_source = None
+            transcript_content = transcript.content
+            if not transcript_content:
+                raise ValueError("Empty transcript content returned from Supadata")
 
-            # Method 1: Try preferred languages
-            for lang in language_preferences:
-                try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(
-                        video_id, 
-                        languages=[lang], 
-                        **request_kwargs
-                    )
-                    transcript_source = f"Language: {lang}"
-                    logger.info(f"Successfully retrieved transcript in {lang}")
-                    break
-                except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
-                    continue
-                except Exception as e:
-                    logger.warning(f"Error with language {lang}: {e}")
-                    continue
+            logger.info("Successfully retrieved transcript content from Supadata")
+            logger.debug(f"Transcript content preview: {transcript_content[:200]}...")
 
-            # Method 2: Try without language specification (auto-detect)
-            if raw_transcript is None:
-                try:
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(
-                        video_id, 
-                        **request_kwargs
-                    )
-                    transcript_source = "Auto-detected language"
-                    logger.info("Successfully retrieved transcript with auto-detection")
-                except Exception as e:
-                    logger.warning(f"Auto-detection failed: {e}")
-
-            # Method 3: Try to get any available transcript
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(
-                        video_id, 
-                        **request_kwargs
-                    )
-                    # Get the first available transcript
-                    for transcript in transcript_list:
-                        try:
-                            raw_transcript = transcript.fetch(**request_kwargs)
-                            transcript_source = f"First available: {transcript.language_code}"
-                            logger.info(f"Retrieved transcript in {transcript.language_code}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch {transcript.language_code}: {e}")
-                            continue
-                except Exception as e:
-                    logger.error(f"Failed to list transcripts: {e}")
-
-            # Method 4: Try to get generated transcript if manual not available
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(
-                        video_id, 
-                        **request_kwargs
-                    )
-                    for transcript in transcript_list:
-                        if transcript.is_generated:
-                            try:
-                                raw_transcript = transcript.fetch(**request_kwargs)
-                                transcript_source = f"Generated: {transcript.language_code}"
-                                logger.info(f"Retrieved generated transcript in {transcript.language_code}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch generated transcript {transcript.language_code}: {e}")
-                                continue
-                except Exception as e:
-                    logger.error(f"Failed to get generated transcripts: {e}")
-
-            # If we still don't have a transcript, try translated versions
-            if raw_transcript is None:
-                try:
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(
-                        video_id, 
-                        **request_kwargs
-                    )
-                    for transcript in transcript_list:
-                        if transcript.is_translatable:
-                            try:
-                                # Try to translate to English
-                                translated = transcript.translate('en')
-                                raw_transcript = translated.fetch(**request_kwargs)
-                                transcript_source = f"Translated to English from {transcript.language_code}"
-                                logger.info(f"Retrieved translated transcript from {transcript.language_code}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to translate from {transcript.language_code}: {e}")
-                                continue
-                except Exception as e:
-                    logger.error(f"Failed to get translatable transcripts: {e}")
-
-            # Final fallback: try without proxy if proxy was used
-            if raw_transcript is None and self.proxy_config:
-                logger.info("Attempting to retrieve transcript without proxy as final fallback...")
-                try:
-                    # Try without proxy
-                    raw_transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                    transcript_source = "Fallback without proxy"
-                    logger.info("Successfully retrieved transcript without proxy")
-                except Exception as e:
-                    logger.warning(f"Fallback without proxy failed: {e}")
-
-            if raw_transcript is None:
-                # Provide detailed error information
-                error_msg = f"Could not retrieve transcript for video {video_id}. "
-                if available_transcripts:
-                    error_msg += f"Available languages: {list(available_transcripts.keys())}. "
-                else:
-                    error_msg += "No transcripts appear to be available. "
-                error_msg += "This could be due to: 1) Transcripts disabled by uploader, 2) Video is too new, 3) Video is private/restricted, 4) Regional restrictions, 5) SSL/Proxy configuration issues."
-                raise ValueError(error_msg)
-
-            logger.info(f"Transcript retrieved via: {transcript_source}")
-            logger.info(f"Transcript contains {len(raw_transcript)} segments")
-
-            # Convert to TranscriptSegment objects
-            segments = []
-            for segment in raw_transcript:
-                # Handle potential missing keys
-                text = segment.get('text', '').strip()
-                start = float(segment.get('start', 0))
-                duration = float(segment.get('duration', 0))
-
-                if text:  # Only add segments with actual text
-                    segments.append(TranscriptSegment(text=text, start=start, duration=duration))
-
+            segments = self._parse_supadata_transcript(transcript_content)
             if not segments:
-                raise ValueError(f"Transcript retrieved but contains no valid text segments for video {video_id}")
+                raise ValueError("No transcript segments found after parsing")
 
-            logger.info(f"Successfully processed {len(segments)} transcript segments")
+            logger.info(f"Successfully extracted {len(segments)} transcript segments")
             return segments
 
-        except (VideoUnavailable, TranscriptsDisabled, NoTranscriptFound) as e:
-            error_msg = f"Transcript unavailable for video {video_id}: {str(e)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
         except Exception as e:
-            error_msg = f"Unexpected error getting transcript for video {video_id}: {str(e)}"
+            error_msg = f"Failed to get transcript for video {video_id} using Supadata: {e}"
             logger.error(error_msg)
             raise ValueError(error_msg)
+
+
+
+    def get_video_info(self, youtube_url: str) -> Dict[str, Any]:
+        """Get video metadata using YouTube API (fallback to basic info if not available)"""
+        video_id = self.extract_video_id(youtube_url)
+        
+        # Try YouTube API first
+        if self.youtube:
+            try:
+                response = self.youtube.videos().list(
+                    part='snippet,statistics,contentDetails',
+                    id=video_id
+                ).execute()
+                
+                if response['items']:
+                    item = response['items'][0]
+                    snippet = item['snippet']
+                    statistics = item.get('statistics', {})
+                    content_details = item.get('contentDetails', {})
+                    
+                    # Parse duration from ISO 8601 format
+                    duration_str = content_details.get('duration', 'PT0S')
+                    duration_seconds = self._parse_iso_duration(duration_str)
+                    
+                    return {
+                        'video_id': video_id,
+                        'title': snippet.get('title'),
+                        'description': snippet.get('description'),
+                        'uploader': snippet.get('channelTitle'),
+                        'upload_date': snippet.get('publishedAt'),
+                        'duration': duration_seconds,
+                        'view_count': int(statistics.get('viewCount', 0)) if statistics.get('viewCount') else 0,
+                        'like_count': int(statistics.get('likeCount', 0)) if statistics.get('likeCount') else 0,
+                        'webpage_url': f"https://www.youtube.com/watch?v={video_id}"
+                    }
+            except Exception as e:
+                logger.warning(f"YouTube API failed: {e}")
+        
+        # Fallback to basic info
+        logger.info("Using fallback video info")
+        return {
+            'video_id': video_id,
+            'title': f"Video {video_id}",
+            'description': '',
+            'uploader': '',
+            'upload_date': '',
+            'duration': 0,
+            'view_count': 0,
+            'like_count': 0,
+            'webpage_url': f"https://www.youtube.com/watch?v={video_id}"
+        }
+    
+    def _parse_iso_duration(self, duration_str: str) -> int:
+        """Parse ISO 8601 duration to seconds"""
+        try:
+            # Remove PT prefix
+            duration_str = duration_str.replace('PT', '')
+            
+            total_seconds = 0
+            
+            # Parse hours
+            if 'H' in duration_str:
+                hours = int(duration_str.split('H')[0])
+                total_seconds += hours * 3600
+                duration_str = duration_str.split('H')[1]
+            
+            # Parse minutes
+            if 'M' in duration_str:
+                minutes = int(duration_str.split('M')[0])
+                total_seconds += minutes * 60
+                duration_str = duration_str.split('M')[1]
+            
+            # Parse seconds
+            if 'S' in duration_str:
+                seconds = int(duration_str.split('S')[0])
+                total_seconds += seconds
+            
+            return total_seconds
+        except Exception:
+            return 0
 
     def chunk_transcript(self, segments: List[TranscriptSegment]) -> List[Document]:
         """Chunk transcript into manageable pieces for embedding"""
@@ -485,7 +393,7 @@ class YouTubeWorkflowService:
             return True
 
         try:
-            logger.info(f"Getting transcript for video {video_id}...")
+            logger.info(f"Getting transcript for video {video_id} using Supadata AI...")
             
             segments = self.get_transcript(youtube_url)
 
@@ -626,23 +534,20 @@ class YouTubeWorkflowService:
 
     def get_video_title(self, video_id: str) -> str:
         """Get video title from YouTube API"""
-        if not self.youtube:
-            return f"Video {video_id}"
+        if self.youtube:
+            try:
+                response = self.youtube.videos().list(
+                    part='snippet',
+                    id=video_id
+                ).execute()
 
-        try:
-            response = self.youtube.videos().list(
-                part='snippet',
-                id=video_id
-            ).execute()
-
-            if response['items']:
-                return response['items'][0]['snippet']['title']
-            else:
-                return f"Video {video_id}"
-
-        except Exception as e:
-            logger.error(f"Error getting video title: {e}")
-            return f"Video {video_id}"
+                if response['items']:
+                    return response['items'][0]['snippet']['title']
+            except Exception as e:
+                logger.warning(f"YouTube API failed: {e}")
+        
+        # Fallback
+        return f"Video {video_id}"
 
 
 def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
@@ -689,4 +594,33 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
         print(f"   📅 Published: {video['published_at'][:10]}")
         print(f"   📝 {desc_preview}")
         print(f"   🔗 {video['url']}")
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Initialize the service
+    try:
+        service = YouTubeWorkflowService()
         
+        # Test video URL
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Replace with actual URL
+        video_id = service.extract_video_id(url)
+        
+        # Get video info
+        info = service.get_video_info(url)
+        print(f"Video Info: {info}")
+        
+        # Index the video
+        success = service.index_video(url, video_id)
+        if success:
+            print(f"Successfully indexed video {video_id}")
+            
+            # Search within the video
+            results = service.search_video_content("your search query", video_id, top_k=3)
+            print_video_segments(results, info.get('title', ''))
+        else:
+            print(f"Failed to index video {video_id}")
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Make sure you have set the SUPADATA_API_KEY environment variable")

@@ -9,13 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
 
-from services.youtube_service import YouTubeWorkflowService
+from app.services.youtube_service import YouTubeWorkflowService
 app = FastAPI()
 
 origins = [
-        "http://localhost:3000",  # Example: Your frontend development server
-        "http://localhost:5173", # Example: Your deployed frontend
-        # Add other allowed origins as needed
+        "http://localhost:3000",  
+        "http://localhost:5173",
+        
     ]
 app.add_middleware(
         CORSMiddleware,
@@ -157,7 +157,7 @@ async def search_transcript(data: SearchRequest):
             
             related_videos_with_segments = []
             for video in related_videos:
-                # Process segments for each related video - get only the best match
+               
                 best_segment = process_related_video_segments(video, data.query, top_k=1)
                 
                 # Only include videos where we found at least one relevant segment

@@ -37,6 +37,7 @@ supadata = Supadata(api_key=os.getenv("SUPADATA_API_KEY"))
 
 # LanceDB setup
 embedding_dim = 768
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 db_path = os.path.join(BASE_DIR, "lancedb_data")
 db = lancedb.connect(db_path)

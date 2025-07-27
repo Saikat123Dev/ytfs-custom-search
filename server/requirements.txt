@@ -138,6 +138,5 @@ weasel==0.4.1
 websockets==15.0.1
 wrapt==1.17.2
 yarl==1.20.1
-youtube-transcript-api==1.1.0
 zstandard==0.23.0
 supadata

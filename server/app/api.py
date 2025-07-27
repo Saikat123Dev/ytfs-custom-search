@@ -12,14 +12,10 @@ import uvicorn
 from app.services.youtube_service import YouTubeWorkflowService
 app = FastAPI()
 
-origins = [
-        "http://localhost:3000",  
-        "http://localhost:5173",
-        
-    ]
+
 app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
+        allow_origins=["*"],
         allow_credentials=True,  # Allow cookies and authorization headers
         allow_methods=["*"],     # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
         allow_headers=["*"],     # Allow all headers

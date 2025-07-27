@@ -183,7 +183,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
     setError('')
     
     try {
-      const response = await fetch('http://localhost:8000/search', {
+      const response = await fetch('https://ytfs-custom-search-l7s5.onrender.com/search', {
         method: "POST",
         headers: {
           'Content-type': 'application/json'

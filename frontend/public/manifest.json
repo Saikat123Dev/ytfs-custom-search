@@ -7,12 +7,12 @@
         "default_popup": "index.html"
     },
     "permissions": [
+        "https://your-backend.onrender.com/",
         "scripting",
         "tabs",
         "activeTab"
     ],
     "host_permissions": [
-        "https://*/*",
-        "http://*/*"
+         "https://ytfs-custom-search-l7s5.onrender.com/*"
     ]
   }

@@ -54,7 +54,7 @@ function App() {
   const [error, setError] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
   const [enableSuggestions,setenableuggestions]=useState(false);
-  const [keepExtensionOpen, setKeepExtensionOpen] = useState(false)
+ 
 
   const[Searchsuggestions,setSearchSuggestions]=useState<RelatedVideo[]>([])
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -153,24 +153,14 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
   },[showPreview])
 
   const openInYouTube = (url: string) => {
-    if (keepExtensionOpen) {
-      
-      if (typeof chrome !== 'undefined' && chrome.tabs) {
-        chrome.tabs.create({ url: url, active: false })
-      } else {
-        const newWindow = window.open(url, '_blank')
-        if (newWindow) {
-          newWindow.focus()
-        }
-      }
-    } else {
+   
      
       if (typeof chrome !== 'undefined' && chrome.tabs) {
         chrome.tabs.create({ url: url })
       } else {
         window.open(url, '_blank')
       }
-    }
+    
   }
 
   const youtubesearch =useCallback( async () => {
@@ -230,9 +220,9 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
   },[userInput,videoLink,enableSuggestions])
 
   return (
-    <div className="w-96 min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 p-4 font-sans">
+    <div className="w-auto min-h-screen bg-gradient-to-br p-2 from-gray-200 to-gray-400  font-sans">
       {/* Settings Section */}
-      <div className="mb-4 p-3 bg-white rounded-xl shadow-sm border border-gray-100">
+      <div className="mb-4 p-3 bg-white rounded-xl shadow-sm border border-gray-300">
         <div className="flex items-center justify-between mb-3">
           <div>
             <h3 className="text-sm font-semibold text-gray-700">Auto-Extract from Tab</h3>
@@ -249,22 +239,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
           </label>
         </div>
         
-        {/* Keep Extension Open Toggle */}
-        <div className="flex items-center justify-between pt-3 border-t border-gray-100">
-          <div>
-            <h3 className="text-sm font-semibold text-gray-700">Keep Extension Open</h3>
-            <p className="text-xs text-gray-500">Prevent extension from closing when opening links</p>
-          </div>
-          <label className="relative inline-flex items-center cursor-pointer">
-            <input
-              type="checkbox"
-              checked={keepExtensionOpen}
-              onChange={(e) => setKeepExtensionOpen(e.target.checked)}
-              className="sr-only peer"
-            />
-            <div className="w-11 h-6 bg-gray-500 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
-          </label>
-        </div>
+       
 
         {currentTabUrl && (
           <div className="mt-2 p-2 bg-gray-50 rounded text-xs">
@@ -346,12 +321,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
               {isValidLink ? 'Valid YouTube Link' : 'Invalid YouTube Link'}
             </div>
           )}
-          {keepExtensionOpen && (
-            <div className="flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-blue-100 text-blue-700">
-              <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-              Stay Open Mode
-            </div>
-          )}
+          
         </div>
 
          <div className="flex items-center justify-between pt-3 border-t border-gray-100">

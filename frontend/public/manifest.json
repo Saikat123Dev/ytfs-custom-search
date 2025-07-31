@@ -3,16 +3,27 @@
     "name": "vite-ts-react-test",
     "version": "1.0",
     "description": "",
+    "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "js/service-worker.js"
+  },
+ 
     "action": {
-        "default_popup": "index.html"
-    },
+    "default_title": "Click to open panel"
+  },
+   "side_panel": {
+    "default_path": "index.html"
+  },
+    
     "permissions": [
-        "https://your-backend.onrender.com/",
-        "scripting",
+        
+      
         "tabs",
-        "activeTab"
+        "activeTab",
+        "sidePanel"
+        , "contextMenus"
     ],
     "host_permissions": [
-         "https://ytfs-custom-search-l7s5.onrender.com/*"
+         "https://ytfs-custom-search-l7s5.onrender.com/search"
     ]
   }

@@ -116,7 +116,7 @@ async def search_transcript(data: SearchRequest):
         input_video_segments = [
             {
                 "timestamp": int(r["start"]),
-                "snippet": " ".join(r['text'].split()[:25]) + "...",
+                "snippet": r['text'],
                 "url": r["url"],
                 "score": round(r["score"], 4)
             }

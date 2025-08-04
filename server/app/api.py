@@ -8,7 +8,7 @@ from googleapiclient.errors import HttpError
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
-from services.youtube_service import YouTubeWorkflowService
+from app.services.youtube_service import YouTubeWorkflowService
 
 app = FastAPI()
 
@@ -86,7 +86,7 @@ def process_related_video_segments(video_info: dict, query: str, top_k: int = 1)
 
         if results:
             r = results[0]
-            snippet = " ".join(r['text'].split()[:25]) + "..."
+            snippet = r['text']
             return {
                 "timestamp": int(r["start"]),
                 "snippet": snippet,

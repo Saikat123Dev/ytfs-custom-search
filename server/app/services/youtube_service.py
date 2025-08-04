@@ -564,9 +564,8 @@ def print_video_segments(segments: List[Dict[str, Any]], video_title: str = ""):
 
     for i, segment in enumerate(segments, 1):
         # Truncate text for display
-        text_preview = " ".join(segment['text'].split()[:30])
-        if len(segment['text'].split()) > 30:
-            text_preview += "..."
+        text_preview = " ".join(segment['text'])
+        
 
         print(f"\n{i}. ⏱️  Timestamp: {int(segment['start'])}s")
         print(f"   📊 Score: {segment['score']:.4f}")

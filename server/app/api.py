@@ -8,7 +8,7 @@ from googleapiclient.errors import HttpError
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
-from app.services.youtube_service import YouTubeWorkflowService
+from services.youtube_service import YouTubeWorkflowService
 
 app = FastAPI()
 

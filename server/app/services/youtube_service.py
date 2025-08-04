@@ -585,9 +585,8 @@ def print_youtube_search_results(videos: List[Dict[str, Any]]):
 
     for i, video in enumerate(videos, 1):
         # Truncate description
-        desc_preview = video['description'][:100]
-        if len(video['description']) > 100:
-            desc_preview += "..."
+        desc_preview = video['description']
+       
 
         print(f"\n{i}. 📺 {video['title']}")
         print(f"   👤 Channel: {video['channel_title']}")

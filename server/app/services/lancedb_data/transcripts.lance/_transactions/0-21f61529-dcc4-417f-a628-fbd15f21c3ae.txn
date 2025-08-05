@@ -1,7 +1,0 @@
-<<<<<<<< HEAD:server/app/services/lancedb_data/transcripts.lance/_transactions/0-21f61529-dcc4-417f-a628-fbd15f21c3ae.txn
-$21f61529-dcc4-417f-a628-fbd15f21c3ae²à$id ÿÿÿÿÿÿÿÿÿ*string08Zdefault,video_id ÿÿÿÿÿÿÿÿÿ*string08Zdefault(text ÿÿÿÿÿÿÿÿÿ*string08Zdefault(start ÿÿÿÿÿÿÿÿÿ*float08Zdefault+duration ÿÿÿÿÿÿÿÿÿ*float08Zdefault=vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:76808Zdefault"'
-========
-$198ab218-f434-4e63-b247-f6e9b0065b43²à$id ÿÿÿÿÿÿÿÿÿ*string08Zdefault,video_id ÿÿÿÿÿÿÿÿÿ*string08Zdefault(text ÿÿÿÿÿÿÿÿÿ*string08Zdefault(start ÿÿÿÿÿÿÿÿÿ*float08Zdefault+duration ÿÿÿÿÿÿÿÿÿ*float08Zdefault=vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:76808Zdefault"'
->>>>>>>> 105cfca5ca050eb608d33baadc3a0ff58ef5c2b2:server/app/services/lancedb_data/transcripts.lance/_transactions/0-198ab218-f434-4e63-b247-f6e9b0065b43.txn
-lance.auto_cleanup.older_than14days"!
-lance.auto_cleanup.interval20

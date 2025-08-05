@@ -54,7 +54,7 @@ function App() {
   const [error, setError] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
   const [enableSuggestions,setenableuggestions]=useState(false);
-  const [keepExtensionOpen, setKeepExtensionOpen] = useState(false)
+ 
 
   const[Searchsuggestions,setSearchSuggestions]=useState<RelatedVideo[]>([])
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -153,24 +153,14 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
   },[showPreview])
 
   const openInYouTube = (url: string) => {
-    if (keepExtensionOpen) {
-      
-      if (typeof chrome !== 'undefined' && chrome.tabs) {
-        chrome.tabs.create({ url: url, active: false })
-      } else {
-        const newWindow = window.open(url, '_blank')
-        if (newWindow) {
-          newWindow.focus()
-        }
-      }
-    } else {
+   
      
       if (typeof chrome !== 'undefined' && chrome.tabs) {
         chrome.tabs.create({ url: url })
       } else {
         window.open(url, '_blank')
       }
-    }
+    
   }
 
   const youtubesearch =useCallback( async () => {
@@ -230,9 +220,9 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
   },[userInput,videoLink,enableSuggestions])
 
   return (
-    <div className="w-96 min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 p-4 font-sans">
+    <div className="w-auto min-h-screen bg-gradient-to-br p-2 from-gray-200 to-gray-400  font-sans">
       {/* Settings Section */}
-      <div className="mb-4 p-3 bg-white rounded-xl shadow-sm border border-gray-100">
+      <div className="mb-4 p-3 bg-white rounded-xl shadow-sm border border-gray-300">
         <div className="flex items-center justify-between mb-3">
           <div>
             <h3 className="text-sm font-semibold text-gray-700">Auto-Extract from Tab</h3>
@@ -249,22 +239,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
           </label>
         </div>
         
-        {/* Keep Extension Open Toggle */}
-        <div className="flex items-center justify-between pt-3 border-t border-gray-100">
-          <div>
-            <h3 className="text-sm font-semibold text-gray-700">Keep Extension Open</h3>
-            <p className="text-xs text-gray-500">Prevent extension from closing when opening links</p>
-          </div>
-          <label className="relative inline-flex items-center cursor-pointer">
-            <input
-              type="checkbox"
-              checked={keepExtensionOpen}
-              onChange={(e) => setKeepExtensionOpen(e.target.checked)}
-              className="sr-only peer"
-            />
-            <div className="w-11 h-6 bg-gray-500 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
-          </label>
-        </div>
+       
 
         {currentTabUrl && (
           <div className="mt-2 p-2 bg-gray-50 rounded text-xs">
@@ -282,7 +257,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
               <path d="M23.498 6.186a2.999 2.999 0 0 0-2.112-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.386.505A2.999 2.999 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a2.999 2.999 0 0 0 2.112 2.136C4.495 20.455 12 20.455 12 20.455s7.505 0 9.386-.505a2.999 2.999 0 0 0 2.112-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
             </svg>
           </div>
-          <h1 className="text-xl font-bold text-gray-800">YouTube Timestamp Search</h1>
+          <h1 className="text-xl font-bold text-gray-800">YouTube Timestamp Sniper</h1>
         </div>
         <p className="text-sm text-gray-600">Search within YouTube videos and jump to exact moments</p>
       </div>
@@ -346,12 +321,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
               {isValidLink ? 'Valid YouTube Link' : 'Invalid YouTube Link'}
             </div>
           )}
-          {keepExtensionOpen && (
-            <div className="flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-blue-100 text-blue-700">
-              <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-              Stay Open Mode
-            </div>
-          )}
+          
         </div>
 
          <div className="flex items-center justify-between pt-3 border-t border-gray-100">
@@ -439,6 +409,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
           
           <div className=" pr-2 space-y-2">
             {searchResults.map((result, index) => (
+             
               <div
                 key={index}
                 className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition-shadow"
@@ -461,8 +432,9 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
                   </div>
                 </div>
                 
-                <p className="text-sm text-gray-700 leading-relaxed mb-2">
-                  {result.snippet}
+                <p className="text-sm text-gray-700 mb-2">
+                  {
+                  result.snippet}
                 </p>
                 
                 <div className="flex justify-end">
@@ -580,7 +552,7 @@ const isValidLink = useMemo(() => !!videoId, [videoId])
 
       {/* Preview Toggle */}
       {isValidLink && (
-        <div className="mb-4">
+        <div className="mb-4 mt-3">
           <button
             onClick={() => setShowPreview(!showPreview)}
             className="w-full bg-red-500 hover:bg-red-600 text-white py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 shadow-sm font-medium"

@@ -86,7 +86,7 @@ def process_related_video_segments(video_info: dict, query: str, top_k: int = 1)
 
         if results:
             r = results[0]
-            snippet = " ".join(r['text'].split()[:25]) + "..."
+            snippet = r['text']
             return {
                 "timestamp": int(r["start"]),
                 "snippet": snippet,
@@ -116,7 +116,7 @@ async def search_transcript(data: SearchRequest):
         input_video_segments = [
             {
                 "timestamp": int(r["start"]),
-                "snippet": " ".join(r['text'].split()[:25]) + "...",
+                "snippet": r['text'],
                 "url": r["url"],
                 "score": round(r["score"], 4)
             }

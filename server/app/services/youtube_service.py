@@ -341,7 +341,7 @@ class YouTubeWorkflowService:
                 return [0.0] * embedding_dim
 
             result = genai.embed_content(
-                model="models/embedding-001",
+                model="gemini-embedding-001",
                 content=text,
                 task_type=task_type
             )
